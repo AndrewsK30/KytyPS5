@@ -45,7 +45,7 @@ constexpr std::array<const char*, Count> Names {
 	"vma_buffer_create", "vma_buffer_create_ns", "dedicated_alloc", "bda_table_upload", "image_create",
 	"tiler_scratch_alloc",
 	"label_interrupt", "label_gpu_waited", "label_clock", "label_other", "label_flushed_by_class",
-	"cat_pm4_ns", "cat_draw_ns", "cat_dispatch_ns", "cat_bindings_ns", "cat_buffer_cache_ns", "cat_image_cache_ns", "cat_tiler_ns", "cat_pipeline_ns", "cat_wait_ns", "cat_submit_ns", "cat_gc_ns", "cat_command_ns", "cat_materialize_ns", "cat_pm4_calls", "cat_draw_calls", "cat_dispatch_calls", "cat_bindings_calls", "cat_buffer_cache_calls", "cat_image_cache_calls", "cat_tiler_calls", "cat_pipeline_calls", "cat_wait_calls", "cat_submit_calls", "cat_gc_calls", "cat_command_calls", "cat_materialize_calls", "protect_calls", "guest_fault_read", "guest_fault_write", "imported_buffers", "imported_buffer_bytes", "import_upload_skipped_bytes", "import_download_skipped"
+	"cat_pm4_ns", "cat_draw_ns", "cat_dispatch_ns", "cat_bindings_ns", "cat_buffer_cache_ns", "cat_image_cache_ns", "cat_tiler_ns", "cat_pipeline_ns", "cat_wait_ns", "cat_submit_ns", "cat_gc_ns", "cat_command_ns", "cat_materialize_ns", "cat_pm4_calls", "cat_draw_calls", "cat_dispatch_calls", "cat_bindings_calls", "cat_buffer_cache_calls", "cat_image_cache_calls", "cat_tiler_calls", "cat_pipeline_calls", "cat_wait_calls", "cat_submit_calls", "cat_gc_calls", "cat_command_calls", "cat_materialize_calls", "protect_calls", "guest_fault_read", "guest_fault_write", "imported_buffers", "imported_buffer_bytes", "import_upload_skipped_bytes", "import_download_skipped", "fault_handler_ns", "protect_ns"
 };
 static_assert(Names.back() != nullptr, "every Metric needs a CSV name, in enum order");
 

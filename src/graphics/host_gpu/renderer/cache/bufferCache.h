@@ -165,6 +165,10 @@ private:
 	// copy back, only a wait for the writer's tick. Page tracking is unchanged.
 	[[nodiscard]] bool ShouldImport(uint64_t begin, uint64_t end) const;
 	uint64_t m_import_wait_tick = 0;
+	// An imported buffer's pages stay CPU-dirty (unprotected) whenever the GPU does not own them: its data needs no upload,
+	// so write faults would only cost time. Releasing GPU ownership therefore marks the pages CPU-dirty again.
+	void ReleaseGpuOwnership(const Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsImportedAddress(uint64_t vaddr);
 	[[nodiscard]] bool TryDownloadInline(Buffer& buffer, std::span<const vk::BufferCopy> copies,
 	                                      Buffer& download, const uint8_t* mapped, uint64_t offset,
 	                                      uint64_t total_size);

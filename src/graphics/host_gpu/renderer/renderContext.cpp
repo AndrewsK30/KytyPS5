@@ -68,6 +68,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	PerformanceDiagnostics::Add(access == PageFaultAccess::Write ? PerformanceDiagnostics::Metric::GuestFaultWrite : PerformanceDiagnostics::Metric::GuestFaultRead);
 	if (access == PageFaultAccess::Write) {
+		PerformanceDiagnostics::Scope fault_timing(PerformanceDiagnostics::Metric::FaultHandlerNs);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

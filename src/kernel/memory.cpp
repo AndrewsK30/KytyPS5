@@ -3819,6 +3819,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	Libs::Graphics::PerformanceDiagnostics::Add(Libs::Graphics::PerformanceDiagnostics::Metric::ProtectCalls);
+	Libs::Graphics::PerformanceDiagnostics::Scope protect_timing(Libs::Graphics::PerformanceDiagnostics::Metric::ProtectNs);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }

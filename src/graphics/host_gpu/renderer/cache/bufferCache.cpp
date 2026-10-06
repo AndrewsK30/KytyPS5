@@ -256,6 +256,18 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	});
 }
 
+void BufferCache::ReleaseGpuOwnership(const Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	if (buffer.IsImported()) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+}
+
+bool BufferCache::IsImportedAddress(uint64_t vaddr) {
+	const auto  id     = m_page_table[PageIndex(vaddr)];
+	const auto* buffer = m_slot_buffers.try_get(id);
+	return buffer != nullptr && !buffer->is_deleted && buffer->IsImported();
+}
 bool BufferCache::ShouldImport(uint64_t begin, uint64_t end) const {
 	struct Range { uint64_t begin = 0, size = 0; };
 	static const std::vector<Range> ranges = [] {
@@ -617,7 +629,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
 			Add(Metric::CleanPageBypass);
 			Add(Metric::ReadNoDownloadRequests);
-			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+			ReleaseGpuOwnership(buffer, page_begin, page_end - page_begin);
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
@@ -667,9 +679,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				if (!upper_bound) { m_scheduler.WaitPriorityOperations(tick); }
 				if (sampled) { record.publish_wait_ns = NowNs() - begin_ns; }
 			}
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			ReleaseGpuOwnership(buffer, window_begin, window_end - window_begin);
 		} else if (downloaded) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			ReleaseGpuOwnership(buffer, window_begin, window_end - window_begin);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -829,6 +841,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (buffer.IsImported() && !is_written) {
+		// Nothing to upload and nothing to re-arm: leaving the pages CPU-dirty keeps them unprotected.
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -934,7 +950,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
-	    (!needs_device_address || m_stream_buffer.HasDeviceAddress()) &&
+	    !IsImportedAddress(vaddr) && (!needs_device_address || m_stream_buffer.HasDeviceAddress()) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
