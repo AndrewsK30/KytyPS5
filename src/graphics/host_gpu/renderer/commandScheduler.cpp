@@ -123,10 +123,20 @@ void CommandScheduler::Shutdown() {
 		}
 		m_operation_state = OperationState::Draining;
 	}
-	if (!m_command.IsInvalid()) {
-		Submit();
+	{
+		PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::Shutdown);
+		PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Shutdown);
+		if (!m_command.IsInvalid()) {
+			Submit();
+		}
+		m_master.Wait(CurrentTick() - 1);
 	}
-	m_master.Wait(CurrentTick() - 1);
+	if (m_submit_thread.joinable()) {
+		// Everything is submitted and complete after the wait above; stop the submit thread.
+		m_submit_thread.request_stop();
+		m_submit_available.notify_all();
+		m_submit_thread.join();
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -370,6 +380,42 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
+	static const bool async_submit = [] {
+		const char* value = std::getenv("KYTY_ASYNC_SUBMIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (async_submit && Active() && submit.num_wait_semaphores == 0 &&
+	    submit.num_signal_semaphores == 0) {
+		AsyncSubmit item;
+		item.info         = submit;
+		item.buffer       = buffer;
+		item.debug_op     = m_command.m_debug_op;
+		item.debug_submit = m_command.m_debug_submit_id;
+		item.debug_arg0   = m_command.m_debug_arg0;
+		item.debug_arg1   = m_command.m_debug_arg1;
+		item.debug_arg2   = m_command.m_debug_arg2;
+		item.debug_arg3   = m_command.m_debug_arg3;
+		item.debug_arg4   = m_command.m_debug_arg4;
+		uint64_t tick;
+		{
+			std::lock_guard lock(m_submit_mutex);
+			if (!m_submit_thread.joinable()) {
+				m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+			}
+			tick = m_master.NextTick();
+			item.info.AddSignal(m_master.Handle(), tick);
+			item.tick = tick;
+			m_submit_queue.push_back(std::move(item));
+		}
+		m_submit_available.notify_one();
+		m_command.m_buffer = nullptr;
+		return tick;
+	}
+	if (Active()) {
+		// A synchronous submit must not overtake command buffers still queued for the submit thread.
+		DrainSubmitQueue();
+	}
+
 	vk::Result result;
 	uint64_t   tick;
 	{
@@ -419,6 +465,78 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+void CommandScheduler::DrainSubmitQueue() {
+	std::unique_lock lock(m_submit_mutex);
+	m_submit_idle.wait(lock, [this] { return m_submit_queue.empty() && !m_submit_busy; });
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	for (;;) {
+		AsyncSubmit item;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			m_submit_available.wait(lock, [this, &stop] {
+				return stop.stop_requested() || !m_submit_queue.empty();
+			});
+			if (m_submit_queue.empty()) {
+				return;
+			}
+			item = std::move(m_submit_queue.front());
+			m_submit_queue.pop_front();
+			m_submit_busy = true;
+		}
+
+		auto&      graphics = m_graphics;
+		vk::Result result;
+		{
+			const auto lock_start = PerformanceDiagnostics::Enabled() ?
+			    std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+			Common::LockGuard lock(graphics.queue_mutex);
+			if (PerformanceDiagnostics::Enabled()) {
+				PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::QueueLockNs,
+				    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - lock_start).count()));
+			}
+			auto& submit = item.info;
+
+			vk::TimelineSemaphoreSubmitInfo timeline_info {};
+			timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+			timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+			timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+			timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+			vk::SubmitInfo submit_info {};
+			submit_info.pNext                = &timeline_info;
+			submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+			submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+			submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+			submit_info.commandBufferCount   = 1;
+			submit_info.pCommandBuffers      = &item.buffer;
+			submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+			submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::QueueSubmitNs);
+			result = graphics.queue.submit(1, &submit_info, nullptr);
+		}
+
+		if (result == vk::Result::eErrorDeviceLost) {
+			DumpDeviceLossDiagnostics(graphics);
+		}
+		if (result != vk::Result::eSuccess) {
+			ReportVulkanFatal("vkQueueSubmit", result, item.tick, item.debug_op, item.debug_submit,
+			                  item.debug_arg0, item.debug_arg1, item.debug_arg2, item.debug_arg3,
+			                  item.debug_arg4);
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submit_busy = false;
+		}
+		m_submit_idle.notify_all();
+	}
 }
 
 void CommandScheduler::BeginNext() {
