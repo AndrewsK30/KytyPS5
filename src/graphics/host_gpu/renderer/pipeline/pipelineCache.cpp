@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
@@ -485,7 +486,9 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+		uint32_t push_data_start_dword) {
+		PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ShaderCompile);
+		PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -1077,6 +1080,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Pipeline);
 	auto* pipeline = TryGetGraphicsPipeline(colors, depth, vertex_info, command, ps_input_info,
 	                                        topology, primitive_restart_enable, programs, false);
 	EXIT_IF(pipeline == nullptr);
@@ -1103,6 +1107,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Pipeline);
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -1280,7 +1285,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		job->driver_cache = m_driver_cache;
 		cached->pending   = job;
 		m_compiler->Submit(job);
-		(void)m_compiler->Wait(*job, g_pipeline_wait);
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::PipelineWaitNs);
+			(void)m_compiler->Wait(*job, g_pipeline_wait);
+		}
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
@@ -1305,6 +1313,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Pipeline);
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

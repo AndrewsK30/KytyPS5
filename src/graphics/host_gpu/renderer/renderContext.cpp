@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -111,6 +112,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
+			PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::FinishUnmap);
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
@@ -151,6 +153,7 @@ void RenderContext::PrepareBda() {
 }
 
 void RenderContext::RunGarbageCollector() {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

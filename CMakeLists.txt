@@ -408,6 +408,13 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+add_executable(performance_diagnostics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerformanceDiagnosticsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/performanceDiagnostics.cpp")
+target_include_directories(performance_diagnostics_tests PRIVATE "${KYTY_SOURCE_DIR}")
+find_package(Threads REQUIRED)
+target_link_libraries(performance_diagnostics_tests Threads::Threads)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -624,6 +631,10 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME performance_diagnostics
+	         COMMAND $<TARGET_FILE:performance_diagnostics_tests> "${PROJECT_BINARY_DIR}/diagnostics-test.csv")
+	add_test(NAME performance_diagnostics_disabled
+	         COMMAND $<TARGET_FILE:performance_diagnostics_tests> --off)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -650,6 +661,12 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME renderer_benchmark_smoke
+		COMMAND ${CMAKE_COMMAND}
+			-DBENCHMARK_EXE=$<TARGET_FILE:shader_recompiler_compute_tests>
+			-DOUTPUT_DIR=${PROJECT_BINARY_DIR}/renderer-benchmark-smoke
+			-P ${KYTY_TESTS_DIR}/RunRendererBenchmark.cmake)
+	set_tests_properties(renderer_benchmark_smoke PROPERTIES TIMEOUT 60)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization

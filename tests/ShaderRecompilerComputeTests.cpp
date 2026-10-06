@@ -89,6 +89,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
@@ -1764,7 +1765,8 @@ std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
 
 namespace TestSpv {
 
-std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
+std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f,
+                                         bool homogeneous_position = false) {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder b;
@@ -1793,7 +1795,8 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   const auto const_f32_w =
       b.Constant(spv::OpConstant, float_type, std::bit_cast<u32>(clip_w));
   const auto in_pos =
-      b.DefineGlobalVariable(ptr_input_vec2, spv::StorageClassInput);
+      b.DefineGlobalVariable(homogeneous_position ? ptr_input_vec4 : ptr_input_vec2,
+                             spv::StorageClassInput);
   const auto in_color =
       b.DefineGlobalVariable(ptr_input_vec4, spv::StorageClassInput);
   const auto out_color =
@@ -1836,15 +1839,17 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   b.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone,
                  func_type);
   b.AddFunction(spv::OpLabel, label);
-  b.AddFunction(spv::OpLoad, vec2_type, pos2, in_pos);
+  b.AddFunction(spv::OpLoad, homogeneous_position ? vec4_type : vec2_type, pos2, in_pos);
   b.AddFunction(spv::OpLoad, vec4_type, color4, in_color);
-  b.AddFunction(spv::OpCompositeExtract, float_type, pos_x, pos2, 0);
-  b.AddFunction(spv::OpCompositeExtract, float_type, pos_y, pos2, 1);
-  b.AddFunction(spv::OpCompositeConstruct, vec4_type, position, pos_x, pos_y,
-                 const_f32_0, const_f32_w);
+  if (!homogeneous_position) {
+    b.AddFunction(spv::OpCompositeExtract, float_type, pos_x, pos2, 0);
+    b.AddFunction(spv::OpCompositeExtract, float_type, pos_y, pos2, 1);
+    b.AddFunction(spv::OpCompositeConstruct, vec4_type, position, pos_x, pos_y,
+                   const_f32_0, const_f32_w);
+  }
   b.AddFunction(spv::OpAccessChain, ptr_output_vec4, position_ptr, per_vertex,
                  const_u32_0);
-  b.AddFunction(spv::OpStore, position_ptr, position);
+  b.AddFunction(spv::OpStore, position_ptr, homogeneous_position ? pos2 : position);
   b.AddFunction(spv::OpStore, out_color, color4);
   if (layered) {
     const auto index = b.AllocateId();
@@ -2698,6 +2703,7 @@ public:
     auto &context = Renderer();
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
+
 
     const auto caller_thread = std::this_thread::get_id();
     std::thread::id gpu_thread;
@@ -4294,6 +4300,52 @@ public:
                                             sizeof(window_value)),
               "readback did not honor the clamped half-open 512 KiB window");
       cache.ReadMemory(base + window_outside_offset, sizeof(window_value));
+
+      // A CPU write must preserve GPU-written bytes before its page becomes writable. The
+      // coalesced download must leave data outside its window GPU-owned until consumed.
+      constexpr uint64_t write_same_page_offset = window_fault_offset + 0x40;
+      constexpr uint64_t write_neighbor_offset = window_outside_offset;
+      constexpr uint32_t cpu_overwrite_value = 0x89abcdefu;
+      for (const auto offset : {window_fault_offset, write_same_page_offset, write_neighbor_offset}) {
+        Libs::LibKernel::Memory::WriteBacking(base + offset, &window_stale, sizeof(window_stale));
+        MarkGpuWrite(base + offset, sizeof(window_value));
+        cache.FillBuffer(base + offset, sizeof(window_value), window_value, false);
+      }
+      cache.ReadMemory(base + window_fault_offset, sizeof(uint32_t), true);
+      uint32_t same_page_backing = 0;
+      uint32_t neighbor_backing = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base + write_same_page_offset, &same_page_backing,
+                                             sizeof(same_page_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + write_neighbor_offset, &neighbor_backing,
+                                             sizeof(neighbor_backing));
+      Require(name, "write readback preserves data and respects its window",
+              same_page_backing == window_value && neighbor_backing == window_stale &&
+                  !cache.HasGpuDirtyBytes(base + write_same_page_offset, sizeof(uint32_t)) &&
+                  cache.HasGpuDirtyBytes(base + write_neighbor_offset, sizeof(uint32_t)) &&
+                  !cache.IsRegionGpuModified(base + window_fault_offset, sizeof(uint32_t)) &&
+                  cache.IsRegionGpuModified(base + write_neighbor_offset, sizeof(uint32_t)) &&
+                  cache.IsRegionCpuModified(base + window_fault_offset, sizeof(uint32_t)),
+              "write readback lost same-page GPU data or downloaded outside its window");
+      // A second CPU writer can arrive after a neighboring request already downloaded this
+      // page. Resolving the clean request must not clear an unrelated dirty GPU window.
+      cache.ReadMemory(base + write_same_page_offset, sizeof(uint32_t), true);
+      Require(name, "already downloaded CPU write stays coherent",
+              cache.IsRegionCpuModified(base + write_same_page_offset, sizeof(uint32_t)) &&
+                  !cache.IsRegionGpuModified(base + write_same_page_offset, sizeof(uint32_t)) &&
+                  cache.HasGpuDirtyBytes(base + write_neighbor_offset, sizeof(uint32_t)),
+              "clean CPU write failed ownership tracking or consumed a dirty external window");
+      Libs::LibKernel::Memory::WriteBacking(base + window_fault_offset, &cpu_overwrite_value,
+                                           sizeof(cpu_overwrite_value));
+      auto [write_owner, write_owner_offset] =
+          cache.ObtainBuffer(base + window_fault_offset, sizeof(uint32_t), false, false, {}, true);
+      Require(name, "write readback reupload preserves both owners",
+              ReadNativeValue(*write_owner, write_owner_offset) == cpu_overwrite_value &&
+                  ReadNativeValue(*write_owner, write_owner->Offset(base + write_same_page_offset)) ==
+                      window_value &&
+                  ReadNativeValue(*write_owner, write_owner->Offset(base + write_neighbor_offset)) ==
+                      window_value,
+              "CPU reupload clobbered a same-page value or a still GPU-owned neighbor");
+      cache.ReadMemory(base + write_neighbor_offset, sizeof(uint32_t));
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
                                             sizeof(first_stale));
@@ -14305,6 +14357,8 @@ public:
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
   }
+
+#include "RendererBenchmark.inc"
 
   void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
     const char *name = packed_vertex_color ? "PackedFloatVertexColor"
@@ -35853,6 +35907,24 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc >= 2 && std::strcmp(argv[1], "--renderer-benchmark") == 0) {
+    Require("RendererBenchmark", "arguments", argc == 5,
+            "usage: --renderer-benchmark OUTPUT_DIRECTORY FRAMES DRAWS_PER_FRAME");
+    const auto parse_count = [](const char* text) {
+      char* end = nullptr;
+      const auto value = std::strtoul(text, &end, 10);
+      Require("RendererBenchmark", "arguments", text[0] != '\0' && *end == '\0' &&
+              value > 0 && value <= 5000, "counts must be integers in 1..5000");
+      return static_cast<uint32_t>(value);
+    };
+    const auto frames = parse_count(argv[3]);
+    const auto draws = parse_count(argv[4]);
+    Require("RendererBenchmark", "arguments", draws % 64 == 0,
+            "draw count must be a multiple of 64 (one complete cube grid)");
+    VulkanHarness vulkan;
+    vulkan.RunRendererBenchmark(argv[2], frames, draws);
+    return 0;
+  }
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;

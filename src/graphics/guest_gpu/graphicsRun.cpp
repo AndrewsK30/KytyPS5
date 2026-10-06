@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
@@ -20,6 +21,8 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <chrono>
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -206,6 +209,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done.release();
 	});
+	PerformanceDiagnostics::WaitTimer timing(PerformanceDiagnostics::WaitSite::CommandSync);
 	done.acquire();
 }
 
@@ -322,6 +326,7 @@ void CommandProcessor::BufferFlush() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
+	PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::FinishProcessor);
 	GetScheduler().Finish();
 }
 
@@ -399,6 +404,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+		PerformanceDiagnostics::RecordLabelSuspend(reinterpret_cast<uint64_t>(addr), static_cast<uint32_t>(m_interrupt_event_id), ReadLabel(addr) != *addr,
+		                                         static_cast<uint64_t>(ref), func);
 		SuspendPm4();
 	}
 }
@@ -427,6 +434,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
+	PerformanceDiagnostics::RecordLabelWriter(reinterpret_cast<uint64_t>(dst), static_cast<uint32_t>(m_interrupt_event_id));
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
@@ -540,6 +548,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	PerformanceDiagnostics::SetThreadRole(PerformanceDiagnostics::ThreadRole::Gpu);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -553,6 +562,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				PerformanceDiagnostics::Scope idle(PerformanceDiagnostics::Metric::GpuIdleNs);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -575,7 +585,15 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						// Every queue is suspended on WAIT_REG_MEM/labels: woken by a published label,
+						// a new submission, or the 100 ms timeout.
+						PerformanceDiagnostics::WaitTimer timing(
+						    PerformanceDiagnostics::WaitSite::GpuLabelBlocked);
+						const auto blocked_from = std::chrono::steady_clock::now();
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						PerformanceDiagnostics::RecordLabelBlockedNs(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - blocked_from).count()));
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -601,7 +619,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::GpuCommandNs);
+				PerformanceDiagnostics::CategoryScope category(PerformanceDiagnostics::Category::Command);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -612,7 +634,12 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete;
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::GpuProcessNs);
+			PerformanceDiagnostics::CategoryScope category(PerformanceDiagnostics::Category::Pm4);
+			complete = gpu->Process(submission);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -1253,6 +1280,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
+		PerformanceDiagnostics::RecordLabelWriter(reinterpret_cast<uint64_t>(dst), static_cast<uint32_t>(m_interrupt_event_id));
 		auto  data = static_cast<uint32_t>(value);
 		if (LabelsAfterGpu()) {
 			// Published when the preceding GPU work has executed, not when it was recorded.
@@ -1321,6 +1349,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					PerformanceDiagnostics::RecordLabelWriter(reinterpret_cast<uint64_t>(dst), static_cast<uint32_t>(m_interrupt_event_id));
 					if (LabelsAfterGpu()) {
 						// The label (or the timestamp, read then) lands when the GPU gets there.
 						PublishLabelAtCompletion(dst, value, sizeof(value), clock_value);
@@ -1447,6 +1476,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::GlobalBarrier);
 	Common::LockGuard lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
@@ -1555,6 +1585,7 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1578,6 +1609,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1607,6 +1639,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Flip);
 	GetScheduler().Flush();
 }
 
@@ -1624,10 +1657,12 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Flip);
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::FinishGds);
 	GetScheduler().Finish();
 }
 

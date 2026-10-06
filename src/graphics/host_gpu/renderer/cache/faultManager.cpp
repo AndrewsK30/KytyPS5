@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -101,6 +102,7 @@ ShaderFaultReport FaultManager::CollectFaults() {
 	ProcessFaultBufferImpl(&report);
 	// The report is owned by this stack frame; its deferred callback must finish
 	// before returning. Newly populated pages are uploaded in the next recording.
+	PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::FinishCollectFaults);
 	m_scheduler.Finish();
 	return report;
 }
@@ -108,6 +110,7 @@ ShaderFaultReport FaultManager::CollectFaults() {
 void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	(void)GetFaultBuffer();
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+		PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::FaultBuffer);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}

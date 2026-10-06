@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -997,6 +998,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Bindings);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -1034,6 +1036,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Bindings);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -1079,6 +1082,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Bindings);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -1139,6 +1143,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Bindings);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -79,9 +80,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::VmaBufferCreate);
+	if (with_bda) { PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::DedicatedAlloc); }
+	vk::Result result;
+	{
+		PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::VmaBufferCreateNs);
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -317,6 +324,15 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
+	const auto ring_site = [usage = Usage()] {
+		switch (usage) {
+			case MemoryUsage::Download: return PerformanceDiagnostics::WaitSite::RingDownload;
+			case MemoryUsage::Stream: return PerformanceDiagnostics::WaitSite::RingStream;
+			case MemoryUsage::Upload: return PerformanceDiagnostics::WaitSite::RingStaging;
+			default: return PerformanceDiagnostics::WaitSite::RingDevice;
+		}
+	}();
+	PerformanceDiagnostics::WaitSiteScope site(ring_site);
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {

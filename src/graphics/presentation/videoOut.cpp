@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -1181,6 +1182,7 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 		if (m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
+		Graphics::PerformanceDiagnostics::WaitTimer timing(Graphics::PerformanceDiagnostics::WaitSite::VideoOutSlot);
 		m_submit_slot_cond_var.Wait(&m_mutex);
 	}
 }
@@ -1194,6 +1196,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
+		Graphics::PerformanceDiagnostics::WaitTimer timing(Graphics::PerformanceDiagnostics::WaitSite::VideoOutFlip);
 		m_done_cond_var.Wait(&m_mutex);
 	}
 }
@@ -1622,6 +1625,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
+	Graphics::PerformanceDiagnostics::Add(Graphics::PerformanceDiagnostics::Metric::FlipCompleted);
 }
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {
@@ -1776,6 +1780,7 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	Common::LockGuard lock(ctx->mutex);
 	const auto        count = ctx->vblank_status.count;
 	while (ctx->opened && ctx->vblank_status.count == count) {
+		Graphics::PerformanceDiagnostics::WaitTimer timing(Graphics::PerformanceDiagnostics::WaitSite::VideoOutVblank);
 		ctx->vblank_cond.Wait(&ctx->mutex);
 	}
 

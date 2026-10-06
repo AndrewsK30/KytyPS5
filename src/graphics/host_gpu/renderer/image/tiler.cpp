@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -97,6 +98,7 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 
 	VmaAllocationCreateInfo allocate {};
 	allocate.usage       = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::TilerScratchAlloc);
 	VkBuffer      buffer = VK_NULL_HANDLE;
 	VmaAllocation memory = nullptr;
 	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
@@ -363,6 +365,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Tiler);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -379,6 +382,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        std::span<const GpuTileInfo> infos) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Tiler);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -394,6 +398,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
                             ColorTransform transform) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Tiler);
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =

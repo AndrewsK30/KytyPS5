@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -207,6 +208,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 }
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	if (image.info.IsDepth()) {
 		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
 		    image.info.tile_mode == Prospero::TileMode::kLinear) {
@@ -225,6 +227,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ImageCreate);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -535,6 +538,7 @@ void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 }
 
 void TextureCache::PrepareImageCopy(Image& image) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
@@ -1011,6 +1015,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1162,6 +1167,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		PerformanceDiagnostics::ReadbackScope attribution(PerformanceDiagnostics::ReadbackSource::Metadata);
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
@@ -1255,6 +1261,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1346,6 +1353,7 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
@@ -1387,6 +1395,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1428,6 +1437,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
@@ -1446,6 +1456,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::ImageCache);
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
@@ -1809,6 +1820,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
+	PerformanceDiagnostics::WaitSiteScope wait_site(PerformanceDiagnostics::WaitSite::TextureDownload);
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1845,6 +1857,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	download->Flush(offset, range.size);
 
 	DownloadImage(image, *download, offset, range.size, std::move(transfer));
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ImageReadbackBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -1991,6 +2004,7 @@ uint64_t TextureCache::LruClock() const noexcept {
 }
 
 void TextureCache::RunGarbageCollector() {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Gc);
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
@@ -2091,6 +2105,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Gc);
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

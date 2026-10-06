@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -2253,6 +2254,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ReleaseMem);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
@@ -2268,6 +2270,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
 	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
 	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+	using PerfMetric = PerformanceDiagnostics::Metric;
+	const auto type_metric = data_sel == 0 ? PerfMetric::ReleaseNoData :
+	                         data_sel == 1 ? PerfMetric::ReleaseDword :
+	                         data_sel == 2 ? PerfMetric::ReleaseQword :
+	                         data_sel == 3 ? PerfMetric::ReleaseTimestamp : PerfMetric::ReleaseGds;
+	PerformanceDiagnostics::Add(type_metric);
 
 	constexpr uint32_t ReleaseMemDstMemory = 0;
 	constexpr uint32_t ReleaseMemDstTcL2   = 1;
@@ -2288,6 +2296,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
 				if (!DeferInterruptOnlyReleaseMemFlushes()) {
+					PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::InterruptFlush);
 					cp.BufferFlush();
 				}
 				break;

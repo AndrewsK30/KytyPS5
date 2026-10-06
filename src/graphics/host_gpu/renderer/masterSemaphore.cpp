@@ -1,9 +1,13 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <chrono>
 #include <cinttypes>
+#include <cstring>
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 namespace Libs::Graphics {
 
@@ -38,11 +42,15 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	const auto site = PerformanceDiagnostics::Enabled() ? PerformanceDiagnostics::EffectiveWaitSite() :
+	                                                      PerformanceDiagnostics::WaitSite::Unknown;
 	if (IsFree(tick)) {
+		PerformanceDiagnostics::RecordWait(site, false, 0);
 		return;
 	}
 	Refresh();
 	if (IsFree(tick)) {
+		PerformanceDiagnostics::RecordWait(site, false, 0);
 		return;
 	}
 
@@ -51,7 +59,35 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// Ticks submitted but not yet completed when the wait starts: how far the GPU runs behind.
+	const auto lag = CurrentTick() - 1 - KnownGpuTick();
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::SemaphoreWait);
+	vk::Result result;
+	{
+		// One zone per wait, named by call site, so Tracy separates the sites without per-packet zones.
+		static constexpr tracy::SourceLocationData wait_location {"Wait", TracyFunction, TracyFile,
+		                                                          static_cast<uint32_t>(__LINE__),
+		                                                          0xC04040};
+		const bool        profiling = tracy::ProfilerAvailable();
+		tracy::ScopedZone zone(&wait_location, TRACY_CALLSTACK, profiling);
+		if (profiling) {
+			const char* name = PerformanceDiagnostics::WaitSiteName(site);
+			zone.Name(name, std::strlen(name));
+		}
+		PerformanceDiagnostics::CategoryScope wait_category(PerformanceDiagnostics::Category::Wait);
+		const auto start = PerformanceDiagnostics::Enabled() ? std::chrono::steady_clock::now() :
+		                                                       std::chrono::steady_clock::time_point {};
+		PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::SemaphoreWaitNs,
+		                                    PerformanceDiagnostics::SemaphoreWaitMetric());
+		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+		if (PerformanceDiagnostics::Enabled()) {
+			PerformanceDiagnostics::RecordWait(
+			    site, true,
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - start).count()),
+			    lag);
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		if (result == vk::Result::eErrorDeviceLost) {
 			DumpDeviceLossDiagnostics(m_graphics);

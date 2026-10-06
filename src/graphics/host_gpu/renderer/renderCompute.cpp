@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -98,7 +99,11 @@ public:
 		}
 		// Reports from earlier work cannot be attributed to this transaction.
 		cache.ProcessFaultBuffer();
-		scheduler.Finish();
+		{
+			PerformanceDiagnostics::WaitSiteScope site(
+			    PerformanceDiagnostics::WaitSite::FinishComputeRecovery);
+			scheduler.Finish();
+		}
 		RangeSet    ranges;
 		const auto& layout = program.bindings;
 		// Sources are per bound (live) buffer; the first descriptor group maps them to resources.
@@ -357,6 +362,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -365,6 +371,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
+	PerformanceDiagnostics::DispatchScope dispatch_record(sh_ctx.GetCs().cs_regs.data_addr,
+	                                                      thread_group_x, thread_group_y, thread_group_z);
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
 		static std::atomic<uint32_t> log_count {0};
@@ -428,6 +436,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		dispatch_record.SetKind(3);
 		ResetBindings();
 		return;
 	}
@@ -440,11 +449,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+		dispatch_record.SetKind(1);
 		ResetBindings();
 		return;
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
+		dispatch_record.SetKind(2);
 		ResetBindings();
 		return;
 	}
@@ -580,6 +591,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.

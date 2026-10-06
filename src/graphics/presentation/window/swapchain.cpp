@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
@@ -114,6 +115,7 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
+		PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::SwapchainFrame);
 		m_scheduler.Wait(frame->present_tick);
 		return frame;
 	}
@@ -973,7 +975,11 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		Swapchain::Status status;
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::AcquireNs);
+			status = swapchain.AcquireNextImage();
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -992,14 +998,21 @@ void Presenter::Impl::Present() {
 				}
 			}
 		}
-		status = swapchain.Present();
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::PresentNs);
+			status = swapchain.Present();
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		PerformanceDiagnostics::Presented();
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::TitleUpdateNs);
+			window.UpdateTitle();
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

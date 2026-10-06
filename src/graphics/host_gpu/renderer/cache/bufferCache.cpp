@@ -9,10 +9,12 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -81,6 +83,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BdaTableUpload);
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
@@ -106,6 +109,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferDelete);
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -173,6 +177,12 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
 	const auto buffer_address = buffer.CpuAddress();
+	if (PerformanceDiagnostics::HasReadbackRecord()) {
+		for (const auto& copy: copies) {
+			PerformanceDiagnostics::RecordDownload(buffer_address + copy.srcOffset, copy.size,
+			                                      Common::AlignUp(copy.size, 64));
+		}
+	}
 	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -313,16 +323,61 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	using namespace PerformanceDiagnostics;
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	auto source = CurrentReadbackSource();
+	if (source == ReadbackSource::Unknown) {
+		source = gpu_thread ? (is_write ? ReadbackSource::GpuWrite : ReadbackSource::GpuRead) :
+		                      (is_write ? ReadbackSource::CpuWrite : ReadbackSource::CpuRead);
+	}
+	Metric request_metric;
+	switch (source) {
+		case ReadbackSource::Metadata: request_metric = Metric::MetadataReadRequests; break;
+		case ReadbackSource::GpuRead: request_metric = Metric::GpuReadRequests; break;
+		case ReadbackSource::GpuWrite: request_metric = Metric::GpuWriteRequests; break;
+		case ReadbackSource::CpuWrite: request_metric = Metric::CpuWriteRequests; break;
+		default: request_metric = Metric::CpuReadRequests; break;
+	}
+	Add(request_metric);
+	Add(Metric::ReadRequestedBytes, size);
+	Scope timing(gpu_thread ? Metric::GpuReadSyncNs : Metric::CpuReadSyncNs);
+	const bool diagnostics = Enabled();
+	const bool sampled = SampleReadback();
+	ReadbackRecord record;
+	record.source = source;
+	record.address = vaddr;
+	record.size = size;
+	const auto start_ns = diagnostics ? NowNs() : 0;
+	record.start_ns = start_ns;
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, source, diagnostics, sampled, start_ns, &record] {
+		ReadbackScope attribution(source);
+		ReadbackRecordScope trace(sampled ? &record : nullptr);
+		const auto entered_ns = diagnostics ? NowNs() : 0;
+		if (diagnostics) { Add(Metric::ReadDispatchNs, entered_ns - start_ns); }
+		if (sampled) {
+			record.dispatch_ns = entered_ns - start_ns;
+			record.tick_begin = m_scheduler.CurrentTick();
+			record.tick_end = record.tick_begin;
+		}
+		const auto prepared = [&] {
+			if (diagnostics) {
+				const auto ns = NowNs() - entered_ns;
+				Add(Metric::ReadPrepareNs, ns);
+				if (sampled) { record.prepare_ns = ns; }
+			}
+		};
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			Add(Metric::ReadNoDownloadRequests);
+			prepared();
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		if (sampled) { record.buffer_address = buffer.CpuAddress(); record.buffer_size = buffer.Size(); }
 
 		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
 		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
@@ -333,19 +388,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			Add(Metric::CleanPageBypass);
+			Add(Metric::ReadNoDownloadRequests);
 			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
+			prepared();
 			return;
 		}
 
-		// Widen nearby CPU reads so they share one GPU drain.
+		// Coalesce nearby accesses so they share one GPU drain, including pre-write readbacks.
 		constexpr uint64_t WindowSize   = 512 * 1024;
 		const auto         buffer_begin = buffer.CpuAddress();
 		const auto         buffer_end   = buffer_begin + buffer.Size();
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+		Add(Metric::ReadWindowBytes, window_end - window_begin);
+		if (sampled) { record.window_address = window_begin; record.window_size = window_end - window_begin; }
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			const auto tick = m_scheduler.CurrentTick();
@@ -356,7 +416,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
+		if (sampled) { record.tick_end = m_scheduler.CurrentTick(); }
 	});
+	if (sampled) { record.total_ns = NowNs() - start_ns; WriteReadback(record); }
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -435,6 +497,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferJoin);
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferJoinBytes, overlap.Size());
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -462,6 +526,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferCreate);
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferCreateBytes, buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
@@ -538,6 +604,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -565,6 +632,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::BufferCache);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -599,6 +667,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::BufferCache);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
 	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
@@ -623,6 +692,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::BufferCache);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -747,6 +817,7 @@ uint64_t BufferCache::LruClock() const noexcept {
 }
 
 void BufferCache::RunGarbageCollector() {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Gc);
 	m_gc_tick++;
 	const auto clock = LruClock();
 	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
@@ -784,6 +855,8 @@ void BufferCache::RunGarbageCollector() {
 		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
+			PerformanceDiagnostics::ReadbackScope attribution(PerformanceDiagnostics::ReadbackSource::Gc);
+			PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::GcDirtyBuffers);
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
@@ -798,7 +871,10 @@ void BufferCache::RunGarbageCollector() {
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(completion_tick);
+	{
+		PerformanceDiagnostics::WaitSiteScope site(PerformanceDiagnostics::WaitSite::GcDirtyDownload);
+		m_scheduler.Wait(completion_tick);
+	}
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];

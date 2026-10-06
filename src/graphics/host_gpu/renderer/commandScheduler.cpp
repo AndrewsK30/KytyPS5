@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -182,8 +183,10 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::Finish);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
+		PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Finish);
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
@@ -195,6 +198,9 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
+		// The caller needs work recorded in the open buffer: submit it and wait for the whole queue.
+		PerformanceDiagnostics::RecordDrain(PerformanceDiagnostics::EffectiveWaitSite());
+		PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Drain);
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
@@ -266,6 +272,8 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	PerformanceDiagnostics::SetThreadRole(PerformanceDiagnostics::ThreadRole::Completion);
+	PerformanceDiagnostics::SetWaitSite(PerformanceDiagnostics::WaitSite::PriorityOps);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -304,12 +312,15 @@ void CommandScheduler::DrainPriorityOperations() {
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
+	const auto published = [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
-	});
+	};
+	PerformanceDiagnostics::WaitTimer timing(PerformanceDiagnostics::WaitSite::PublishWait,
+	                                         !published());
+	m_operation_available.wait(lock, published);
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -344,6 +355,12 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	PerformanceDiagnostics::CategoryScope category_scope(PerformanceDiagnostics::Category::Submit);
+	PerformanceDiagnostics::Add(Active() ? PerformanceDiagnostics::Metric::RendererSubmit :
+	                                      PerformanceDiagnostics::Metric::PresenterSubmit);
+	if (Active()) {
+		PerformanceDiagnostics::RecordSubmit(PerformanceDiagnostics::CurrentSubmitReason());
+	}
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -356,7 +373,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	vk::Result result;
 	uint64_t   tick;
 	{
+		const auto lock_start = PerformanceDiagnostics::Enabled() ?
+		    std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		Common::LockGuard lock(graphics.queue_mutex);
+		if (PerformanceDiagnostics::Enabled()) {
+			PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::QueueLockNs,
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - lock_start).count()));
+		}
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
@@ -376,7 +400,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		{
+			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::QueueSubmitNs);
+			result = graphics.queue.submit(1, &submit_info, nullptr);
+		}
 	}
 
 	if (result == vk::Result::eErrorDeviceLost) {
