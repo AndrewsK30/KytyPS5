@@ -8,7 +8,7 @@ apart there; a gain counts only after a same-scene comparison.
 
 ## Branch stack
 
-Each branch builds on the previous one (the stack order is 00, 01 ... 06, 07, 11, 08). Nothing is pushed anywhere; the base is
+Each branch builds on the previous one (the stack order is 00, 01 ... 09). Nothing is pushed anywhere; the base is
 `wolverine-performance` (`1e2185db`).
 
 | Branch | What it adds | Default behaviour change |
@@ -21,8 +21,8 @@ Each branch builds on the previous one (the stack order is 00, 01 ... 06, 07, 11
 | `wp/05-pipeline-cache` | Kyty's own pipeline cache also in dirty builds (`KYTY_PIPELINE_CACHE_NO_DIRTY=1` restores the refusal); `KYTY_PIPELINE_NO_OPT` (measured: no effect); slow pipeline log | on for the cache |
 | `wp/06-readback-queue` | `KYTY_READBACK_QUEUE=1`: guest readbacks of finished GPU data on a second queue; GPU write tick tracking; `KYTY_READBACK_UPPER_BOUND=1` (unsafe, measurement only) | opt-in |
 | `wp/07-structure-metrics` | Per-queue GPU-thread time, a Materialize category, per-buffer readback/upload stats, `VirtualProtect` and fault counters | none (off unless `KYTY_PERF_*` files) |
-| `wp/11-host-pointer-import` | `KYTY_HOST_IMPORT=1` + `KYTY_HOST_IMPORT_RANGES`: selected guest buffers use the guest's own memory (VK_EXT_external_memory_host), no upload or copy back, pages left unprotected; import probe | opt-in, needs `KYTY_LABELS_AFTER_GPU`; the range list is per title |
-| `wp/08-dispatch-prep-once` | A dispatch prepares its bindings once unless a recovery snapshot needs the earlier pass (`KYTY_DISPATCH_PREP_TWICE=1` restores it); materialization repeat/read counters | on |
+| `wp/08-host-pointer-import` | `KYTY_HOST_IMPORT=1` + `KYTY_HOST_IMPORT_RANGES`: selected guest buffers use the guest's own memory (VK_EXT_external_memory_host), no upload or copy back, pages left unprotected; import probe | opt-in, needs `KYTY_LABELS_AFTER_GPU`; the range list is per title |
+| `wp/09-dispatch-prep-once` | A dispatch prepares its bindings once unless a recovery snapshot needs the earlier pass (`KYTY_DISPATCH_PREP_TWICE=1` restores it); materialization repeat/read counters | on |
 
 All the label work only matters with `KYTY_LABELS_AFTER_GPU=1`, which `tools/performance/capture.ps1`
 sets in every capture; the numbers in the logs are for that mode.
