@@ -71,6 +71,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A second queue of the same family for guest readbacks of data the GPU has already finished,
+	// so they need not wait behind the main queue's pending work. Null if the family has one queue.
+	vk::Queue                          readback_queue = nullptr;
+	uint32_t                           queue_count    = 1;
 	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {

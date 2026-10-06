@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
 #include <shared_mutex>
 #include <span>
@@ -88,6 +89,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Latest scheduler tick that may have written [vaddr, vaddr + size): once the GPU has reached it,
+	// the bytes are final until the next GPU write.
+	[[nodiscard]] uint64_t          LastGpuWriteTick(uint64_t vaddr, uint64_t size) const;
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
@@ -150,7 +154,20 @@ private:
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-	                                        uint64_t total_size);
+	                                        uint64_t total_size, bool inline_ok);
+	// Copies GPU-written bytes the GPU has already finished on the readback queue and publishes them
+	// to guest memory before returning, without waiting for the main queue's pending work.
+	[[nodiscard]] bool TryDownloadInline(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+	                                      Buffer& download, const uint8_t* mapped, uint64_t offset,
+	                                      uint64_t total_size);
+
+	// Readback queue objects (GPU thread only), created on first use.
+	vk::CommandPool                                    m_readback_pool;
+	vk::CommandBuffer                                  m_readback_command;
+	vk::Fence                                          m_readback_fence;
+	// Downloads that completed on the readback queue (no tick to wait for) and ones left to the scheduler.
+	uint64_t                                           m_inline_downloads   = 0;
+	uint64_t                                           m_deferred_downloads = 0;
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;
@@ -162,6 +179,15 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// The newest GPU writes with the scheduler tick they were recorded in; a full ring overwrites the
+	// oldest and raises m_gpu_write_floor, so LastGpuWriteTick never reports a tick that is too early.
+	// Guarded by m_dirty_ranges_mutex.
+	struct GpuWrite {
+		uint64_t begin = 0, end = 0, tick = 0;
+	};
+	std::array<GpuWrite, 1024>                         m_gpu_writes {};
+	size_t                                             m_gpu_write_next  = 0;
+	uint64_t                                           m_gpu_write_floor = 0;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
 	// Guards changes to both range sets (GPU thread and download completions) against

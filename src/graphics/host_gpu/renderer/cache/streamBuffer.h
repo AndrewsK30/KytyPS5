@@ -73,6 +73,9 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Scheduler tick of the command buffer that was recording when this buffer was created; a join copies
+	// the old contents in that command buffer, so the contents are only final once the GPU reached it.
+	uint64_t created_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

@@ -410,11 +410,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priority[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	const auto family_properties = physical_device.getQueueFamilyProperties();
+	queue_create_info.queueCount = (queue_family < family_properties.size() && family_properties[queue_family].queueCount >= 2) ? 2u : 1u;
+	queue_create_info.pQueuePriorities = queue_priority;
+	graphics.queue_count                 = queue_create_info.queueCount;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1093,6 +1095,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.queue_count >= 2) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
