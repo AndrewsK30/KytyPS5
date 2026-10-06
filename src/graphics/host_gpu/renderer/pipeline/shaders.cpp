@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -577,10 +578,30 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	return owner;
 }
 
+// A driver compile that takes this long stalls the GPU thread; name it so the stall can be attributed.
+static void LogSlowPipeline(const char* kind, std::chrono::steady_clock::time_point started) {
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+	if (ms >= 200) { std::fprintf(stderr, "SlowPipeline: vkCreate%sPipelines took %lld ms\n", kind, static_cast<long long>(ms)); }
+}
+
+// Experiment: KYTY_PIPELINE_NO_OPT=1 asks the driver to skip pipeline optimization, which is much
+// faster to compile on first use at some cost in shader speed.
+static bool PipelineNoOptimization() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_NO_OPT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
                                   vk::Pipeline* pipeline) {
+	auto pipeline_info = build.pipeline_info;
+	if (PipelineNoOptimization()) { pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization; }
+	const auto started = std::chrono::steady_clock::now();
 	const auto result =
-	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
+	    build.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr, pipeline);
+	LogSlowPipeline("graphics", started);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(*pipeline));
@@ -656,13 +677,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	if (PipelineNoOptimization()) { info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization; }
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto started = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	LogSlowPipeline("compute", started);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

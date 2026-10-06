@@ -812,7 +812,7 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (git_hash.ends_with("-dirty") && std::getenv("KYTY_PIPELINE_CACHE_NO_DIRTY") != nullptr) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
