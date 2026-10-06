@@ -63,6 +63,8 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferWait();
+	// Submits after an EOP label per KYTY_LABEL_FLUSH_EVERY (see graphicsRun.cpp).
+	void            FlushAfterLabel(const void* dst, uint32_t bytes, bool with_interrupt, bool clock);
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -182,6 +184,7 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	uint32_t  m_labels_since_flush          = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };

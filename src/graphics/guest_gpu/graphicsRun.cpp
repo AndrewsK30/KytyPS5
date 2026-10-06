@@ -320,7 +320,106 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
+// Experiment: KYTY_LABELS_AFTER_GPU submits after every EOP label so its tick can complete, which
+// was ~83% of renderer submits (~1,070 per frame, ~16 ms of vkQueueSubmit on the GPU thread).
+// KYTY_LABEL_FLUSH_EVERY=N submits only every N labels; 0 leaves it to the end of the PM4 slice.
+// Every slice that progressed ends in BufferFlush, including one that suspends on WAIT_REG_MEM,
+// so a deferred label is still submitted without waiting for a later command. Labels are still
+// published only after the GPU completes the tick. Unset means 0; KYTY_LABEL_FLUSH_EVERY=1 restores the
+// per-label submit.
+static uint32_t LabelFlushEvery() {
+	static const uint32_t every = [] {
+		const char* value = std::getenv("KYTY_LABEL_FLUSH_EVERY");
+		return value == nullptr || value[0] == '\0' ? 0u :
+		                                               static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return every;
+}
+
+// Label classes by known consumer. A CPU guest thread polling memory cannot be observed, so
+// "other" means "no GPU wait or interrupt seen", not "no consumer".
+enum LabelClass : uint32_t { LabelClassInterrupt = 1, LabelClassGpuWait = 2, LabelClassClock = 4,
+                             LabelClassOther = 8 };
+
+// Addresses the GPU has waited on (WAIT_REG_MEM, COND_INDIRECT), at 4-byte granularity.
+static std::mutex                   g_waited_labels_mutex;
+static std::unordered_set<uint64_t> g_waited_labels;
+
+static void NoteWaitedLabel(const volatile void* address) {
+	static const bool tracking = std::getenv("KYTY_LABEL_FLUSH_KEEP") != nullptr;
+	if (!tracking) {
+		return;
+	}
+	std::lock_guard lock(g_waited_labels_mutex);
+	g_waited_labels.insert(reinterpret_cast<uint64_t>(address) & ~uint64_t {3});
+}
+
+static bool IsWaitedLabel(const void* address, uint32_t bytes) {
+	const auto base = reinterpret_cast<uint64_t>(address) & ~uint64_t {3};
+	std::lock_guard lock(g_waited_labels_mutex);
+	for (uint32_t offset = 0; offset < bytes; offset += 4) {
+		if (g_waited_labels.contains(base + offset)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_LABEL_FLUSH_KEEP=<mask> keeps the immediate submit only for the label classes in the mask
+// (1 interrupt, 2 GPU-waited address, 4 timestamp, 8 other); the rest wait for the end of the
+// slice. Unset keeps every class, which is the previous behaviour.
+static uint32_t LabelFlushKeepMask() {
+	static const uint32_t mask = [] {
+		const char* value = std::getenv("KYTY_LABEL_FLUSH_KEEP");
+		return value == nullptr || value[0] == '\0' ? 15u :
+		                                               static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return mask;
+}
+
+void CommandProcessor::FlushAfterLabel(const void* dst, uint32_t bytes, bool with_interrupt,
+                                       bool clock) {
+	using PerformanceDiagnostics::Metric;
+	uint32_t label_class = LabelClassOther;
+	if (with_interrupt) {
+		label_class = LabelClassInterrupt;
+	} else if (IsWaitedLabel(dst, bytes)) {
+		label_class = LabelClassGpuWait;
+	} else if (clock) {
+		label_class = LabelClassClock;
+	}
+	PerformanceDiagnostics::Add(label_class == LabelClassInterrupt ? Metric::LabelInterrupt :
+	                            label_class == LabelClassGpuWait   ? Metric::LabelGpuWaited :
+	                            label_class == LabelClassClock     ? Metric::LabelClock :
+	                                                                 Metric::LabelOther);
+	const bool keep = (LabelFlushKeepMask() & label_class) != 0;
+	const auto every = LabelFlushEvery();
+	if (!keep || every == 0 || ++m_labels_since_flush < every) {
+		// Diagnostic: does the skipped submit matter because it ended the render pass and
+		// separated memory, rather than because of when the label is published?
+		// KYTY_LABEL_DEFER_MODE: 1 = global barrier (also ends rendering), 2 = end rendering only.
+		static const uint32_t mode = [] {
+			const char* value = std::getenv("KYTY_LABEL_DEFER_MODE");
+			return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		}();
+		if (mode == 1) {
+			EmitGlobalBarrier();
+		} else if (mode == 2) {
+			GetScheduler().EndRendering();
+		}
+		return;
+	}
+	PerformanceDiagnostics::Add(Metric::LabelFlushedByClass);
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::LabelFlush);
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Label);
+	m_labels_since_flush = 0;
+	GetScheduler().Flush();
+}
+
 void CommandProcessor::BufferFlush() {
+	m_labels_since_flush = 0;
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ProcessorFlush);
+	PerformanceDiagnostics::SubmitReasonScope reason(PerformanceDiagnostics::SubmitReason::Processor);
 	GetScheduler().Flush();
 }
 
@@ -388,6 +487,7 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 template <typename T>
 T CommandProcessor::ReadLabel(const volatile T* addr) const {
+	NoteWaitedLabel(addr);
 	return GuestGpu::LabelsDeferred() ? m_renderer.GetGpu().ReadLabel(addr) : *addr;
 }
 
@@ -1308,7 +1408,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		}
 		if (LabelsAfterGpu()) {
 			// Submit so the tick can complete; the label and any interrupt follow it.
-			GetScheduler().Flush();
+			FlushAfterLabel(dst, sizeof(data), with_interrupt, false);
 		}
 	};
 
@@ -1377,7 +1477,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						Sync::WriteAtEndOfPipe64(m_submit_id, command, dst, value);
 					}
 					if (LabelsAfterGpu()) {
-						GetScheduler().Flush();
+						FlushAfterLabel(dst, sizeof(value), with_interrupt, clock_value);
 					}
 				};
 
