@@ -169,6 +169,21 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	});
 }
 
+uint64_t GuestGpu::AddPendingLabel(uint64_t address, uint64_t value, uint32_t size) {
+	EXIT_IF(!IsGpuThread() || (size != 4 && size != 8));
+	g_labels_deferred.store(true, std::memory_order_relaxed);
+	const auto sequence = ++m_label_sequence;
+	m_pending_labels[address] = {value, size, sequence};
+	return sequence;
+}
+
+void GuestGpu::ErasePendingLabel(uint64_t address, uint64_t sequence) {
+	const auto pending = m_pending_labels.find(address);
+	if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
+		m_pending_labels.erase(pending);
+	}
+}
+
 template <typename T>
 T GuestGpu::ReadLabel(const volatile T* address) const {
 	if (!m_pending_labels.empty()) {
@@ -1769,10 +1784,25 @@ void CommandProcessor::SynchronizeGpu() {
 void CommandProcessor::PublishLabelAtCompletion(void* dst, uint64_t value, uint32_t bytes,
                                                 bool clock) {
 	auto& renderer = m_renderer;
-	GetScheduler().DeferPriorityOperation([&renderer, dst, value, bytes, clock] {
+	static const bool visible = [] {
+		const char* value = std::getenv("KYTY_LABEL_PENDING_VISIBLE");
+		return value == nullptr || value[0] != '0';
+	}();
+	// A timestamp is read at completion, so it has no value to show the GPU thread earlier.
+	const uint64_t sequence = (visible && !clock && GuestGpu::IsGpuThread())
+	                              ? renderer.GetGpu().AddPendingLabel(reinterpret_cast<uint64_t>(dst), value, bytes)
+	                              : 0;
+	GetScheduler().DeferPriorityOperation([&renderer, dst, value, bytes, clock, sequence] {
 		const uint64_t data = clock ? Sync::ReadReferenceClock() : value;
 		// The backing write cannot fault into the caches from this thread.
 		LibKernel::Memory::WriteBacking(reinterpret_cast<uint64_t>(dst), &data, bytes);
+		PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::LabelPublished);
+		if (sequence != 0) {
+			const auto address = reinterpret_cast<uint64_t>(dst);
+			(void)renderer.GetGpu().TrySendCommand([&renderer, address, sequence] {
+				renderer.GetGpu().ErasePendingLabel(address, sequence);
+			});
+		}
 		renderer.GetGpu().Wake();
 	});
 }

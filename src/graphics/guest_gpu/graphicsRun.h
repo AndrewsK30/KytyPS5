@@ -45,6 +45,12 @@ public:
 	[[nodiscard]] static bool LabelsDeferred() noexcept;
 	// GPU thread.
 	void DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size);
+	// KYTY_LABEL_PENDING_VISIBLE=1 (with KYTY_LABELS_AFTER_GPU): a label published when the GPU completes is
+	// already visible to the GPU thread's own WAIT_REG_MEM/COND checks (ReadLabel) once it is recorded, because
+	// the GPU executes the writer before any later command of its queue. Guest memory still gets the value
+	// only at completion. AddPendingLabel runs on the GPU thread; ErasePendingLabel is sent back to it.
+	[[nodiscard]] uint64_t AddPendingLabel(uint64_t address, uint64_t value, uint32_t size);
+	void ErasePendingLabel(uint64_t address, uint64_t sequence);
 	template <typename T>
 	[[nodiscard]] T ReadLabel(const volatile T* address) const;
 
