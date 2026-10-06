@@ -71,11 +71,35 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 	return policy;
 }
 
+// KYTY_DISPATCH_PREP_TWICE=1 restores the pass that prepared every dispatch's bindings once before the dispatch loop
+// and again inside it; without it the early pass runs only for a dispatch that takes a recovery snapshot.
+static bool PrepareBeforeRecovery(bool recovery_needed) {
+	static const bool always = std::getenv("KYTY_DISPATCH_PREP_TWICE") != nullptr;
+	return always || recovery_needed;
+}
+
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
 class DispatchBufferRecovery {
 public:
+	// Whether the constructor below will take a snapshot (same conditions, without its side effects). When it will
+	// not, the bindings the dispatch loop prepares are the only ones that matter.
+	static bool Needed(RenderContext& context, const PreparedBindings& bindings, uint64_t shader_address) {
+		const auto& program = *bindings.runtime->program;
+		if (!program.info.uses_dma ||
+		    std::any_of(program.info.images.begin(), program.info.images.end(),
+		                [](const auto& image) { return image.written; })) {
+			return false;
+		}
+		auto& policy = RecoveryPolicy();
+		if (policy.always || context.GetBufferCache().UnattributedFaults() != policy.seen_faults) {
+			return true;
+		}
+		const auto found = policy.clean_runs.find(shader_address);
+		return found == policy.clean_runs.end() || found->second < policy.trust_runs;
+	}
+
 	DispatchBufferRecovery(RenderContext& context, const PreparedBindings& bindings,
 	                       uint64_t shader_address)
 	    : m_context(context), m_shader_address(shader_address) {
@@ -556,8 +580,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
+	// The loop below prepares the bindings itself; this earlier pass only matters to a recovery snapshot.
+	if (PrepareBeforeRecovery(DispatchBufferRecovery::Needed(m_context, bindings, cs_regs.cs_regs.data_addr))) {
+		RebindImages(bindings);
+		RebindBuffers(bindings);
+	}
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
@@ -629,8 +656,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
+	if (PrepareBeforeRecovery(DispatchBufferRecovery::Needed(m_context, bindings, cs_regs.cs_regs.data_addr))) {
+		RebindImages(bindings);
+		RebindBuffers(bindings);
+	}
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
