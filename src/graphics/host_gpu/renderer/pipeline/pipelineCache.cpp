@@ -569,9 +569,13 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (entry != programs.end()) {
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
+			const bool materialized = [&] {
+				PerformanceDiagnostics::CategoryScope materialize_scope(PerformanceDiagnostics::Category::Materialize);
+				return ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+				                                                   entry->second.resources,
+				                                                   entry->second.specialization);
+			}();
+			if (!materialized) {
 				// A descriptor source that cannot be read right now (memory the guest has not
 				// mapped or filled yet) skips this draw rather than the session; the next one
 				// re-evaluates from scratch.

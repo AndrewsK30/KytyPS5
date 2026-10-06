@@ -15,7 +15,7 @@ from analyze import analyze, flip_window, load_rows  # noqa: E402
 FIELDS = ("calls", "blocking", "ns", "lag_ticks", "drains")
 SUBMITS = ("label", "processor", "flip", "drain", "finish", "shutdown", "other")
 CATEGORIES = ("pm4", "draw", "dispatch", "bindings", "buffer_cache", "image_cache", "tiler", "pipeline",
-              "wait", "submit", "gc", "command")
+              "wait", "submit", "gc", "command", "materialize")
 
 
 def wait_sites(totals):

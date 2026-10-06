@@ -180,6 +180,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size, bool inline_ok) {
 	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferReadbackBytes, total_size);
+	PerformanceDiagnostics::RecordBufferEvent(buffer.CpuAddress(), buffer.Size(), PerformanceDiagnostics::BufferEvent::Readback, total_size, 0);
 	PerformanceDiagnostics::ReadbackBytes(total_size);
 	const auto buffer_address = buffer.CpuAddress();
 	if (PerformanceDiagnostics::HasReadbackRecord()) {
@@ -549,6 +550,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
+		if (diagnostics) { RecordBufferEvent(buffer.CpuAddress(), buffer.Size(), BufferEvent::Wait, 0, NowNs() - entered_ns); }
 		if (sampled) { record.tick_end = m_scheduler.CurrentTick(); }
 	});
 	if (sampled) { record.total_ns = NowNs() - start_ns; WriteReadback(record); }
@@ -739,6 +741,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferUploadBytes, total_size);
+	PerformanceDiagnostics::RecordBufferEvent(buffer.CpuAddress(), buffer.Size(), PerformanceDiagnostics::BufferEvent::Upload, total_size, 0);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {

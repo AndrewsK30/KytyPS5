@@ -27,8 +27,9 @@ enum class Metric : unsigned {
 	BufferCreate, BufferCreateBytes, BufferJoin, BufferJoinBytes, BufferDelete,
 	VmaBufferCreate, VmaBufferCreateNs, DedicatedAlloc, BdaTableUpload, ImageCreate, TilerScratchAlloc,
 	LabelInterrupt, LabelGpuWaited, LabelClock, LabelOther, LabelFlushedByClass,
-	CatPm4Ns, CatDrawNs, CatDispatchNs, CatBindingsNs, CatBufferCacheNs, CatImageCacheNs, CatTilerNs, CatPipelineNs, CatWaitNs, CatSubmitNs, CatGcNs, CatCommandNs,
-	CatPm4Calls, CatDrawCalls, CatDispatchCalls, CatBindingsCalls, CatBufferCacheCalls, CatImageCacheCalls, CatTilerCalls, CatPipelineCalls, CatWaitCalls, CatSubmitCalls, CatGcCalls, CatCommandCalls,
+	CatPm4Ns, CatDrawNs, CatDispatchNs, CatBindingsNs, CatBufferCacheNs, CatImageCacheNs, CatTilerNs, CatPipelineNs, CatWaitNs, CatSubmitNs, CatGcNs, CatCommandNs, CatMaterializeNs,
+	CatPm4Calls, CatDrawCalls, CatDispatchCalls, CatBindingsCalls, CatBufferCacheCalls, CatImageCacheCalls, CatTilerCalls, CatPipelineCalls, CatWaitCalls, CatSubmitCalls, CatGcCalls, CatCommandCalls, CatMaterializeCalls,
+	ProtectCalls, GuestFaultRead, GuestFaultWrite,
 	Count
 };
 
@@ -51,7 +52,7 @@ enum class SubmitReason { Other, Label, Processor, Flip, Drain, Finish, Shutdown
 // Exclusive GPU-thread time by category: a nested scope's time is charged to the inner category
 // only, so the categories add up to the time inside Pm4 and Command. Other threads are ignored.
 enum class Category : unsigned {
-	Pm4, Draw, Dispatch, Bindings, BufferCache, ImageCache, Tiler, Pipeline, Wait, Submit, Gc, Command,
+	Pm4, Draw, Dispatch, Bindings, BufferCache, ImageCache, Tiler, Pipeline, Wait, Submit, Gc, Command, Materialize,
 	Count
 };
 void EnterCategory(Category category);
@@ -185,6 +186,16 @@ private:
 	std::chrono::steady_clock::time_point m_start {};
 };
 void WriteDispatchFile();
+// Per PS5 queue (KYTY_PERF_QUEUE_CSV): PM4 slices processed, GPU-thread time inside them and the exclusive
+// category time they contain. The GPU thread sets the queue it is processing; other threads are ignored.
+constexpr unsigned MaxQueues = 64;
+void SetCurrentQueue(unsigned queue);
+void RecordQueueSlice(unsigned queue, uint64_t ns);
+void WriteQueueFile();
+// Per guest buffer (KYTY_PERF_BUFFER_CSV): how often and how expensively the CPU and GPU hand it data.
+enum class BufferEvent : unsigned { Readback, Upload, Wait };
+void RecordBufferEvent(uint64_t address, uint64_t size, BufferEvent event, uint64_t bytes, uint64_t ns);
+void WriteBufferFile();
 // WAIT_REG_MEM suspensions by label address (KYTY_PERF_LABEL_CSV): how often a queue suspends on it, how
 // often the awaited value was a GPU-pending label (the GPU has yet to complete its writer), and the time the
 // GPU thread then sat idle with every queue blocked, attributed to the address suspended last.

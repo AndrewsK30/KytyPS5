@@ -753,7 +753,11 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			PerformanceDiagnostics::Scope timing(PerformanceDiagnostics::Metric::GpuProcessNs);
 			PerformanceDiagnostics::CategoryScope category(PerformanceDiagnostics::Category::Pm4);
+			PerformanceDiagnostics::SetCurrentQueue(submission.queue_id);
+			const auto slice_from = std::chrono::steady_clock::now();
 			complete = gpu->Process(submission);
+			PerformanceDiagnostics::RecordQueueSlice(submission.queue_id, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - slice_from).count()));
+			PerformanceDiagnostics::SetCurrentQueue(PerformanceDiagnostics::MaxQueues);
 		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);

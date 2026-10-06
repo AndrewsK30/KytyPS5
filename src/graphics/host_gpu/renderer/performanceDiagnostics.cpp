@@ -45,7 +45,7 @@ constexpr std::array<const char*, Count> Names {
 	"vma_buffer_create", "vma_buffer_create_ns", "dedicated_alloc", "bda_table_upload", "image_create",
 	"tiler_scratch_alloc",
 	"label_interrupt", "label_gpu_waited", "label_clock", "label_other", "label_flushed_by_class",
-	"cat_pm4_ns", "cat_draw_ns", "cat_dispatch_ns", "cat_bindings_ns", "cat_buffer_cache_ns", "cat_image_cache_ns", "cat_tiler_ns", "cat_pipeline_ns", "cat_wait_ns", "cat_submit_ns", "cat_gc_ns", "cat_command_ns", "cat_pm4_calls", "cat_draw_calls", "cat_dispatch_calls", "cat_bindings_calls", "cat_buffer_cache_calls", "cat_image_cache_calls", "cat_tiler_calls", "cat_pipeline_calls", "cat_wait_calls", "cat_submit_calls", "cat_gc_calls", "cat_command_calls"
+	"cat_pm4_ns", "cat_draw_ns", "cat_dispatch_ns", "cat_bindings_ns", "cat_buffer_cache_ns", "cat_image_cache_ns", "cat_tiler_ns", "cat_pipeline_ns", "cat_wait_ns", "cat_submit_ns", "cat_gc_ns", "cat_command_ns", "cat_materialize_ns", "cat_pm4_calls", "cat_draw_calls", "cat_dispatch_calls", "cat_bindings_calls", "cat_buffer_cache_calls", "cat_image_cache_calls", "cat_tiler_calls", "cat_pipeline_calls", "cat_wait_calls", "cat_submit_calls", "cat_gc_calls", "cat_command_calls", "cat_materialize_calls", "protect_calls", "guest_fault_read", "guest_fault_write"
 };
 static_assert(Names.back() != nullptr, "every Metric needs a CSV name, in enum order");
 
@@ -123,6 +123,8 @@ struct State {
 				Write("sample", 0);
 				WriteDispatchFile();
 				WriteLabelFile();
+				WriteQueueFile();
+				WriteBufferFile();
 				std::fflush(file);
 				if (readback_file != nullptr) { std::fflush(readback_file); }
 			}
@@ -321,7 +323,7 @@ thread_local CategoryState g_categories;
 // "delay_<category>_ns=N" that is polled every 100 ms, so A/B can alternate inside one process.
 std::array<std::atomic<uint64_t>, CategoryCount> g_delay_ns {};
 const char* const CategoryKeys[] = {"pm4", "draw", "dispatch", "bindings", "buffer_cache", "image_cache",
-                                    "tiler", "pipeline", "wait", "submit", "gc", "command"};
+                                    "tiler", "pipeline", "wait", "submit", "gc", "command", "materialize"};
 static_assert(std::size(CategoryKeys) == CategoryCount, "every Category needs a delay key");
 std::atomic<bool> g_delay_any {false};
 
@@ -366,12 +368,96 @@ void SpinDelay(Category category) {
 	while (std::chrono::steady_clock::now() < until) { }
 }
 
+// Per PS5 queue: the GPU thread processes one queue at a time, so a thread-local id attributes its time.
+thread_local unsigned g_current_queue = MaxQueues;
+struct QueueStats {
+	std::atomic<uint64_t> slices {0}, ns {0};
+	std::array<std::atomic<uint64_t>, CategoryCount> category_ns {};
+};
+std::array<QueueStats, MaxQueues> g_queue_stats;
+
 void ChargeCategory(Category category, std::chrono::steady_clock::time_point now) {
 	const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	    now - g_categories.last).count());
 	Add(static_cast<Metric>(static_cast<unsigned>(Metric::CatPm4Ns) + static_cast<unsigned>(category)), ns);
+	if (g_current_queue < MaxQueues) {
+		g_queue_stats[g_current_queue].category_ns[static_cast<unsigned>(category)].fetch_add(ns, std::memory_order_relaxed);
+	}
+}
+const char* QueuePath() {
+	static const char* path = std::getenv("KYTY_PERF_QUEUE_CSV");
+	return path != nullptr && path[0] != '\0' && Enabled() ? path : nullptr;
 }
 } // namespace
+
+void SetCurrentQueue(unsigned queue) { g_current_queue = queue < MaxQueues ? queue : MaxQueues; }
+
+void RecordQueueSlice(unsigned queue, uint64_t ns) {
+	if (queue >= MaxQueues || !Enabled()) { return; }
+	g_queue_stats[queue].slices.fetch_add(1, std::memory_order_relaxed);
+	g_queue_stats[queue].ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void WriteQueueFile() {
+	const auto* path = QueuePath();
+	if (path == nullptr) { return; }
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) { return; }
+	std::fprintf(file, "queue,slices,process_ns");
+	for (const auto* key: CategoryKeys) { std::fprintf(file, ",cat_%s_ns", key); }
+	std::fprintf(file, "\n");
+	for (unsigned q = 0; q < MaxQueues; ++q) {
+		const auto slices = g_queue_stats[q].slices.load(std::memory_order_relaxed);
+		if (slices == 0) { continue; }
+		std::fprintf(file, "%u,%llu,%llu", q, static_cast<unsigned long long>(slices),
+		             static_cast<unsigned long long>(g_queue_stats[q].ns.load(std::memory_order_relaxed)));
+		for (unsigned i = 0; i < CategoryCount; ++i) {
+			std::fprintf(file, ",%llu", static_cast<unsigned long long>(g_queue_stats[q].category_ns[i].load(std::memory_order_relaxed)));
+		}
+		std::fprintf(file, "\n");
+	}
+	std::fclose(file);
+}
+
+namespace {
+struct BufferAggregate { uint64_t size = 0, readbacks = 0, readback_bytes = 0, uploads = 0, upload_bytes = 0, waits = 0, wait_ns = 0; };
+std::mutex g_buffer_mutex;
+std::map<uint64_t, BufferAggregate> g_buffers;
+const char* BufferPath() {
+	static const char* path = std::getenv("KYTY_PERF_BUFFER_CSV");
+	return path != nullptr && path[0] != '\0' && Enabled() ? path : nullptr;
+}
+} // namespace
+
+void RecordBufferEvent(uint64_t address, uint64_t size, BufferEvent event, uint64_t bytes, uint64_t ns) {
+	if (BufferPath() == nullptr) { return; }
+	std::lock_guard lock(g_buffer_mutex);
+	auto& aggregate = g_buffers[address];
+	aggregate.size = size;
+	switch (event) {
+		case BufferEvent::Readback: ++aggregate.readbacks; aggregate.readback_bytes += bytes; break;
+		case BufferEvent::Upload: ++aggregate.uploads; aggregate.upload_bytes += bytes; break;
+		case BufferEvent::Wait: ++aggregate.waits; aggregate.wait_ns += ns; break;
+	}
+}
+
+void WriteBufferFile() {
+	const auto* path = BufferPath();
+	if (path == nullptr) { return; }
+	std::lock_guard lock(g_buffer_mutex);
+	if (g_buffers.empty()) { return; }
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) { return; }
+	std::fprintf(file, "address,size,readbacks,readback_bytes,uploads,upload_bytes,waits,wait_ns\n");
+	for (const auto& [address, value]: g_buffers) {
+		std::fprintf(file, "0x%016llx,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", static_cast<unsigned long long>(address),
+		             static_cast<unsigned long long>(value.size), static_cast<unsigned long long>(value.readbacks),
+		             static_cast<unsigned long long>(value.readback_bytes), static_cast<unsigned long long>(value.uploads),
+		             static_cast<unsigned long long>(value.upload_bytes), static_cast<unsigned long long>(value.waits),
+		             static_cast<unsigned long long>(value.wait_ns));
+	}
+	std::fclose(file);
+}
 
 void EnterCategory(Category category) {
 	if (!Enabled() || g_thread_role != ThreadRole::Gpu || g_categories.depth >= g_categories.stack.size()) {

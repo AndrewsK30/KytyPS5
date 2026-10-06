@@ -66,6 +66,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	PerformanceDiagnostics::Add(access == PageFaultAccess::Write ? PerformanceDiagnostics::Metric::GuestFaultWrite : PerformanceDiagnostics::Metric::GuestFaultRead);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);

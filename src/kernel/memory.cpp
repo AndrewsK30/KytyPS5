@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/performanceDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -3812,6 +3813,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	Libs::Graphics::PerformanceDiagnostics::Add(Libs::Graphics::PerformanceDiagnostics::Metric::ProtectCalls);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
