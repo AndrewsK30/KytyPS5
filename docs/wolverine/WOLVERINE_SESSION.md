@@ -603,3 +603,58 @@ A cutscene NÃO avança por tempo real: no mesmo instante a variante `new` está
 | 600 a 900 | só old-2: 5,22 | 5,43 / 5,30 (5,37) | +2,7% (1 amostra do old, não conclusivo) |
 
 `wait_gpu_label_blocked`: 18 a 31 ms/frame em old contra 0,0 em new. Em tempo real (janelas iguais de relógio após o 3º X) o new ficou +19% e +34% à frente, mas esse número mistura trechos diferentes da cutscene, por isso não o uso. Limites: 2 execuções por lado; 3ª janela fraca; não verifiquei se há diferença visual quadro a quadro além de olhar screenshots avulsos (sem artefatos aparentes); gameplay após a cutscene não foi medido.
+
+### Branches empilhadas (2026-10-06) — nada enviado a nenhum remoto
+Base: `wolverine-performance` em `1e2185db` (intocada). Pilha local, cada branch sobre a anterior (separadas por hunk a partir do estado final, script `split.py` no scratchpad; cada estágio compilou e a ponta passou no CTest, 53/54, só `kernel_file_system` falha como antes):
+
+| Branch | Commit | Conteúdo |
+|---|---|---|
+| `wp/00-docs` | `116907cd` | `docs/wolverine/` (relatórios, plano, log) + README com o mapa da pilha |
+| `wp/01-diagnostics` | `fdfabd3d` | `PerformanceDiagnostics`, `tools/performance`, benchmark e testes; sem mudança de comportamento |
+| `wp/02-label-flush` | `1b632c25` | `KYTY_LABEL_FLUSH_EVERY` (padrão 0) |
+| `wp/03-label-pending-visible` | `85fbfe25` | labels pendentes visíveis à thread GPU (padrão ligado) |
+| `wp/04-async-submit` | `163d6905` | `KYTY_ASYNC_SUBMIT` (opt-in) |
+| `wp/05-pipeline-cache` | `abe9bc10` | cache de pipelines do Kyty em build dirty, log de compilações lentas, `KYTY_PIPELINE_NO_OPT` |
+| `wp/06-readback-queue` | `19e3226e` | readback em segunda fila (opt-in), rastreio de escritas GPU, `KYTY_READBACK_UPPER_BOUND` (inseguro) |
+
+A ponta `wp/06-readback-queue` reproduz byte a byte (sem contar fim de linha) o estado final que estava no diretório de trabalho (conferido contra o stash). O stash `wolverine-final-state-before-stack` (`stash@{0}`) e o backup em `G:\kity_work\backup-pre-cleanup\` (`stack-start-*`) ficam como segurança. O diretório de trabalho está em `wp/06-readback-queue`, limpo. Cuidado: a cópia de `docs/wolverine/WOLVERINE_SESSION.md` dentro de `wp/00-docs` foi tirada antes desta seção; o log completo e atual fica em `G:\kity_work\WOLVERINE_SESSION.md`.
+
+### Fase 0 do plano estrutural (2026-10-06): onde o tempo realmente está — `f0-*`, branch `wp/07-structure-metrics` (`ecfcd336`)
+Menu e cutscene do helicóptero, 2 execuções cada, `async.exe`, padrões atuais. Janela dos números por frame: últimos 40 s.
+
+| Pergunta (portão) | Menu | Helicóptero |
+|---|---|---|
+| Fila de compute (fila 1) no tempo de fatias da thread GPU (item 3) | 53% e 55% (fila 0: 45% e 47%) | 46% e 45% (fila 0: 54% e 55%) |
+| `MaterializeResources` (item 2) | 8,5 ms/frame, 1.658 chamadas/frame (~5 µs) | 19 a 20 ms/frame, ~2.370 chamadas/frame |
+| `dispatch` / `draw` / `bindings` / `wait` (ms/frame) | 7,0 / 3,3 / 1,9 / 15 | 7,3 / 41 / 14,8 / 27 |
+| `VirtualProtect` por frame | ~5.000 | ~4.350 |
+| Faltas de escrita / leitura por frame | ~4.400 / ~50 | ~4.100 / ~47 |
+
+Os três portões passam: a fila de compute pesa ~50% (portão do item 3 era ≥ 25%), `MaterializeResources` pesa ~15% do frame (item 2) e as esperas de readback se concentram em poucos buffers (item 1). As fatias da fila 1 são de compute e por isso incluem 17 s de `wait` e 12 s de `dispatch` na janela total.
+
+**Descoberta que muda a prioridade do item 1.** Os buffers que mais esperam NÃO são os pequenos (o plano supunha labels e buffers pequenos): em `buffers.csv`, `0x12c0000000` (70 MB) tem 71.015 readbacks (37 GB) e 22.684 uploads (18,8 GB) e sozinho é ~50% da espera total de readback (16,7 s de 33,7 s no menu; 44% no helicóptero); `0x11935d0000` (97 MB) ~20%; `0x1210000000` (2,7 GB) ~14% no menu e 18% no helicóptero. Buffers de até 1 MiB são só 6 a 9% da espera e 0% dos bytes lidos de volta. Os ~4.400 faltas de escrita e ~5.000 proteções por frame batem com ~12 MB/frame de upload e ~17 MB/frame de escrita do jogo no buffer grande (4.400 páginas de 4 KB por frame): o custo do rastreamento de páginas está no ciclo "jogo escreve → falta → upload → reproteger". Isso sugere que importar buffers grandes escolhidos por medição (não por tamanho) pode valer mais que o previsto; hipótese, não medida. Falta saber o que é `0x12c0000000` e o custo por falta/protect.
+
+Total (menu, 150 s): leituras de volta 50 GB, uploads 39 GB, espera de readback 33,7 s.
+
+### Item 1 — importar memória do jogo (`wp/11-host-pointer-import`, commit `00932f1e`) — resultados parciais
+**1.0 (sondagem, `KYTY_HOST_IMPORT_PROBE=1`)**: o driver NVIDIA aceita importar o alias (visão `MapViewOfFile`) como memória Vulkan: `vkGetMemoryHostPointerPropertiesEXT` ok (memoryTypeBits 0xc), `allocateMemory` com `VkImportMemoryHostPointerInfoEXT` + `DEVICE_ADDRESS` ok, `bindBufferMemory` ok, `vkGetBufferDeviceAddress` ok (4 faixas de 1,5 a 3 MB). Alinhamento exigido: `minImportedHostPointerAlignment`.
+**1.1/1.2 (implementação)**: `KYTY_HOST_IMPORT=1` + `KYTY_HOST_IMPORT_RANGES=<hex>+<tam>,...` (exige `KYTY_LABELS_AFTER_GPU`); sem upload, sem cópia de volta (a leitura do jogo espera só o tick da última escrita GPU), dependência de memória para o host no fim do command buffer que escreveu, junção só entre importados.
+Menu (`imp-*`, 2 execuções por lado): referência 17,24 / 17,29 FPS; importando só `0x12c0000000+0x4600000` (70 MB) 20,01 / 19,97 FPS: **+15,8%**; 18,7 GB de uploads e ~70.000 downloads evitados; sem erros; `wait` 15,0 para 11,5 ms/frame. Faltas de escrita (~4.400/frame) e proteções (~5.000/frame) não mudaram (o rastreio de páginas continua igual).
+**Regressão ao importar mais**: com 4 faixas (`0x12c0000000`, `0x11935d0000` 97 MB, `0x1187184000` 22 MB, `0x118c5f0000` 3 MB; `imp2-a`) o menu caiu para **9,84 FPS** e com o heap de 2,7 GB também (`imp2-b`) para 9,48 FPS; a espera de readback subiu para ~60 ms/frame, 41 s só no buffer `0x11935d0000`. Hipótese (não confirmada): buffers que os shaders leem e escrevem com intensidade ficam lentos quando a GPU acessa memória do sistema pela PCIe, e cada espera de tick passa a durar mais. Conclusão provisória: importar só buffers escritos pela CPU e pouco usados pela GPU; a lista é por título e precisa de medição.
+
+### Item 1 concluído até 1.3: importar o buffer de 70 MB (`wp/11-host-pointer-import`)
+Cutscene do helicóptero (3 X), `himp-*`, 2 execuções por lado, janelas por quadros apresentados após o 3º X (mesma suposição de antes): referência 8,45 / 8,43 / 4,84 FPS; importando só `0x12c0000000+0x4600000`: 10,23 / 10,29 / 5,45 (**+21,2% / +22,1% / +12,8%**), sem erros, cena correta nos screenshots. Menu: +15,8%. Importar mais buffers (97 MB, 22 MB, 3 MB, 2,7 GB) piorou muito (ver acima): só vale para buffers escritos pela CPU e pouco usados pelos shaders; a lista é por título.
+**1.3 (páginas importadas sem proteção de escrita)**: faltas de escrita 4.393 para 1.737/frame, tempo do tratador 23,8 para 12,9 ms/frame (somado nas threads do jogo), `VirtualProtect` 4.978 para 2.356/frame; FPS 20,68 para 20,86 (ruído). Portanto o custo das faltas **não** está no caminho crítico do frame; a mudança fica por reduzir trabalho e contenção, sem ganho de FPS comprovado. Helicóptero com 1.3: 10,55 / 10,30 / 5,63.
+Custo medido do tratamento de faltas (menu, importando): 5,4 µs por falta de escrita no tratador, 1,7 µs por `VirtualProtect`.
+Limite: um buffer, uma máquina, endereços do jogo fixos entre execuções; a importação exige `KYTY_LABELS_AFTER_GPU`.
+
+### Degrau 2.1: preparar os bindings do dispatch uma vez (`wp/08-dispatch-prep-once`)
+`renderCompute.cpp`: `DispatchDirect`/`DispatchIndirect` rebindavam imagens e buffers antes do laço e de novo na 1ª iteração; a passagem antiga só importa para o snapshot do `DispatchBufferRecovery` (shaders com BDA sem histórico confiável). `DispatchBufferRecovery::Needed` repete as condições do construtor sem efeitos colaterais; `KYTY_DISPATCH_PREP_TWICE=1` restaura o antigo. Menu (`p21-*`, 2 execuções por lado, 18:3x): 17,76 / 17,86 contra 18,08 / 18,18 FPS (**+1,8%**); bindings 1,90 para 1,59 ms/frame, buffer cache 4,79 para 3,96, dispatch 6,80 para 6,59; sem erros. Ganho pequeno e consistente; só menu testado (helicóptero e título não rodados para esta mudança).
+
+### Degrau 2.2 refutado e custo de MaterializeResources — branch `wp/08-dispatch-prep-once` (`mat-repeat`, `mat-reads`)
+Menu, 1.666 materializações por frame, ~10 ms/frame (≈6 µs cada):
+- **Só 2,0% das materializações repetem o resultado anterior do mesmo programa** (5,1% se contar só os descritores, sem SRT achatado e user data). Memoizar `MaterializeResources` (degrau 2.2) não pode compensar: **abandonado por evidência** (a mesma conclusão do fork: resultados não se repetem entre frames).
+- Cada materialização faz ~20,6 leituras de memória do jogo (34.312 por frame); o callback de leitura soma 3,9 ms/frame (115 ns por leitura com o custo do cronômetro), ~40% do custo. O resto (~6 ms/frame) é caminhada/decodificação/especialização. Potencial de micro-otimização na CPU: da ordem de 2 a 3 ms/frame (≈5%), sem mudança estrutural; o degrau 2.3 (a GPU ler o SRT) é o único que elimina os ~10 ms, com o custo de reescrever a emissão do recompilador (riscos de layouts, DCC/HTILE, tempo de vida de imagens).
+
+### Itens 3 e 4: avaliação de viabilidade (sem código)
+Fila de compute = ~50% do tempo de fatias da thread GPU (Fase 0), mas **todo o trabalho caro de draw/dispatch roda sob `RenderContext::m_mutex`** (`DispatchDirect/Indirect`, `DrawIndex/DrawAuto` seguram a trava inteira, incluindo `MaterializeResources`, bindings, caches de buffer/imagem), então duas threads de PM4 só se sobreporiam no que está fora dela (decodificação de PM4, labels, esperas): ganho esperado pequeno até que o cache de buffer, o de imagens, os anéis de stream, o `RenderExecutor` e o estado de layout das imagens se tornem seguros para concorrência, o que é uma reescrita grande e de alto risco. Item 4 (pré-materialização especulativa) esbarra na taxa de repetição de 2% (nada reaproveitável entre frames) e em tabelas escritas pela GPU. Recomendação: não iniciar 3 nem 4 como estão; revisitar só com um projeto de caches thread-safe.
