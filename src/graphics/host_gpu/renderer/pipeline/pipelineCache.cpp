@@ -164,6 +164,8 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	if (values.empty()) {
 		return false;
 	}
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::MaterializeReadCalls);
+	PerformanceDiagnostics::Scope read_timing(PerformanceDiagnostics::Metric::MaterializeReadNs);
 	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
@@ -201,6 +203,8 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	if (values.empty()) {
 		return false;
 	}
+	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::MaterializeReadCalls);
+	PerformanceDiagnostics::Scope read_timing(PerformanceDiagnostics::Metric::MaterializeReadNs);
 	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
@@ -575,6 +579,27 @@ struct PipelineCache::ProgramCache {
 				                                                   entry->second.resources,
 				                                                   entry->second.specialization);
 			}();
+			if (materialized && PerformanceDiagnostics::Enabled()) {
+				// Diagnostics: would a memo of the previous result for this program have been valid? The
+				// descriptors alone, or also the flattened SRT and user data.
+				const auto fnv = [](uint64_t h, const void* data, size_t bytes) {
+					const auto* p = static_cast<const uint8_t*>(data);
+					for (size_t i = 0; i < bytes; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
+					return h;
+				};
+				const auto& snap = entry->second.resources;
+				uint64_t    descriptors = 1469598103934665603ull;
+				descriptors = fnv(descriptors, snap.buffers.data(), snap.buffers.size() * sizeof(snap.buffers[0]));
+				descriptors = fnv(descriptors, snap.images.data(), snap.images.size() * sizeof(snap.images[0]));
+				descriptors = fnv(descriptors, snap.samplers.data(), snap.samplers.size() * sizeof(snap.samplers[0]));
+				uint64_t all = fnv(descriptors, snap.flattened_srt.data(), snap.flattened_srt.size() * sizeof(uint32_t));
+				all          = fnv(all, snap.user_data.data(), snap.user_data.size() * sizeof(uint32_t));
+				static std::unordered_map<const void*, std::pair<uint64_t, uint64_t>> last;
+				auto& previous = last[&entry->second];
+				if (previous.second == all) { PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::MaterializeSame); }
+				if (previous.first == descriptors) { PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::MaterializeSameDescriptors); }
+				previous = {descriptors, all};
+			}
 			if (!materialized) {
 				// A descriptor source that cannot be read right now (memory the guest has not
 				// mapped or filled yet) skips this draw rather than the session; the next one
