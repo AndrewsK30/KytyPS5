@@ -111,8 +111,90 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+uint32_t Buffer::ImportMemoryType(GraphicContext& graphics, const uint8_t* host, uint64_t size,
+                                  vk::BufferUsageFlags flags) {
+	const auto alignment = graphics.host_pointer_alignment;
+	if (!graphics.external_memory_host || alignment == 0 || host == nullptr || size == 0 ||
+	    reinterpret_cast<uintptr_t>(host) % alignment != 0 || size % alignment != 0) {
+		return UINT32_MAX;
+	}
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	if (graphics.device.getMemoryHostPointerPropertiesEXT(vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+	                                                      host, &properties) != vk::Result::eSuccess) {
+		return UINT32_MAX;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo info {};
+	info.pNext       = &external;
+	info.size        = size;
+	info.usage       = flags;
+	info.sharingMode = vk::SharingMode::eExclusive;
+	vk::Buffer probe = nullptr;
+	if (graphics.device.createBuffer(&info, nullptr, &probe) != vk::Result::eSuccess) {
+		return UINT32_MAX;
+	}
+	const auto requirements = graphics.device.getBufferMemoryRequirements(probe);
+	graphics.device.destroyBuffer(probe, nullptr);
+	if (requirements.size > size) {
+		return UINT32_MAX;
+	}
+	const auto  bits   = properties.memoryTypeBits & requirements.memoryTypeBits;
+	uint32_t    result = UINT32_MAX;
+	const auto& memory = graphics.physical_device_memory_properties;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+		const auto type_flags = memory.memoryTypes[i].propertyFlags;
+		if ((bits & (1u << i)) != 0 && (type_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+			result = i;
+			if (type_flags & vk::MemoryPropertyFlagBits::eHostCoherent) { break; }
+		}
+	}
+	return result;
+}
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, uint8_t* host, uint32_t memory_type)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(size == 0 || host == nullptr || memory_type == UINT32_MAX);
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext       = &external;
+	buffer_info.size        = size;
+	buffer_info.usage       = flags;
+	buffer_info.sharingMode = vk::SharingMode::eExclusive;
+	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess);
+
+	vk::ImportMemoryHostPointerInfoEXT import_info {};
+	import_info.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	import_info.pHostPointer = host;
+	vk::MemoryAllocateFlagsInfo allocate_flags {};
+	allocate_flags.pNext = &import_info;
+	allocate_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &allocate_flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = memory_type;
+	EXIT_NOT_IMPLEMENTED(graphics.device.allocateMemory(&allocate, nullptr, &m_imported_memory) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(graphics.device.bindBufferMemory(m_buffer, m_imported_memory, 0) != vk::Result::eSuccess);
+
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = m_buffer;
+	m_device_address    = graphics.device.getBufferAddress(address_info);
+	EXIT_IF(m_device_address == 0);
+	m_coherent = bool(graphics.physical_device_memory_properties.memoryTypes[memory_type].propertyFlags &
+	                  vk::MemoryPropertyFlagBits::eHostCoherent);
+	m_mapped   = {host, static_cast<size_t>(size)};
+}
+
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_imported_memory != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		m_graphics->device.freeMemory(m_imported_memory, nullptr);
+		return;
+	}	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

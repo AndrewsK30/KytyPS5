@@ -1076,7 +1076,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
@@ -1093,6 +1094,16 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	for (const auto* extension: device_extensions) {
+		if (std::strcmp(extension, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+			vk::PhysicalDeviceProperties2                    properties2 {};
+			properties2.pNext = &host_properties;
+			graphic_ctx.physical_device.getProperties2(&properties2);
+			graphic_ctx.external_memory_host   = true;
+			graphic_ctx.host_pointer_alignment = host_properties.minImportedHostPointerAlignment;
+		}
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.queue_count >= 2) {

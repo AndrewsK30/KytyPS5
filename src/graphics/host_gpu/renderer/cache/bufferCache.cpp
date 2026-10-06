@@ -145,12 +145,19 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 			    // An older deferred download of these bytes could still land after an inline one.
 		    if (m_downloading_ranges.Intersects(start, end - start)) { inline_ok = false; }
-		    m_downloading_ranges.Add(start, end - start);
+		    if (!buffer.IsImported()) { m_downloading_ranges.Add(start, end - start); }
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
+	}
+	if (buffer.IsImported()) {
+		// The bytes already are the guest's; the GPU only has to have finished writing them.
+		for (const auto& copy: copies) {
+			m_import_wait_tick = std::max(m_import_wait_tick, LastGpuWriteTick(buffer_address + copy.srcOffset, copy.size));
+		}
+		return true;
 	}
 	const auto capacity = m_download_buffer.Size();
 	for (size_t first = 0; first < copies.size();) {
@@ -249,6 +256,117 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	});
 }
 
+bool BufferCache::ShouldImport(uint64_t begin, uint64_t end) const {
+	struct Range { uint64_t begin = 0, size = 0; };
+	static const std::vector<Range> ranges = [] {
+		std::vector<Range> result;
+		const char* enabled = std::getenv("KYTY_HOST_IMPORT");
+		const char* list    = std::getenv("KYTY_HOST_IMPORT_RANGES");
+		// Labels must reach the guest only after the GPU, or an imported buffer could be reused while the GPU
+		// still reads it; without that rule importing is unsafe.
+		if (enabled == nullptr || enabled[0] == '0' || list == nullptr || std::getenv("KYTY_LABELS_AFTER_GPU") == nullptr) {
+			return result;
+		}
+		const char* cursor = list;
+		while (*cursor != '\0') {
+			char* next = nullptr;
+			const auto begin_value = std::strtoull(cursor, &next, 0);
+			if (next == cursor || *next != '+') { break; }
+			cursor = next + 1;
+			const auto size_value = std::strtoull(cursor, &next, 0);
+			if (next == cursor) { break; }
+			result.push_back({begin_value, size_value});
+			cursor = (*next == ',') ? next + 1 : next;
+			if (*next != ',') { break; }
+		}
+		return result;
+	}();
+	for (const auto& range: ranges) {
+		if (begin >= range.begin && end <= range.begin + range.size) { return true; }
+	}
+	return false;
+}
+void BufferCache::ProbeHostPointerImport(uint64_t vaddr, uint64_t size) {
+	static std::atomic<int> probes {0};
+	if (!m_graphics.external_memory_host || m_graphics.host_pointer_alignment == 0 || probes.load() >= 4) {
+		return;
+	}
+	++probes;
+	const auto alignment = m_graphics.host_pointer_alignment;
+	auto*      host      = Libs::LibKernel::Memory::FindBackingForImport(vaddr, size);
+	if (host == nullptr) {
+		std::fprintf(stderr, "HostImportProbe: no single backing for guest 0x%llx size 0x%llx\n",
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+		return;
+	}
+	if (reinterpret_cast<uintptr_t>(host) % alignment != 0 || size % alignment != 0) {
+		std::fprintf(stderr, "HostImportProbe: guest 0x%llx host %p size 0x%llx not aligned to 0x%llx\n",
+		             static_cast<unsigned long long>(vaddr), static_cast<void*>(host),
+		             static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment));
+		return;
+	}
+	const auto device = m_graphics.device;
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	const auto result = device.getMemoryHostPointerPropertiesEXT(
+	    vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, host, &properties);
+	std::fprintf(stderr, "HostImportProbe: guest 0x%llx host %p size 0x%llx properties=%s memoryTypeBits=0x%x\n",
+	             static_cast<unsigned long long>(vaddr), static_cast<void*>(host),
+	             static_cast<unsigned long long>(size), vk::to_string(result).c_str(), properties.memoryTypeBits);
+	if (result != vk::Result::eSuccess) {
+		return;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext       = &external;
+	buffer_info.size        = size;
+	buffer_info.usage       = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	buffer_info.sharingMode = vk::SharingMode::eExclusive;
+	vk::Buffer buffer = nullptr;
+	if (device.createBuffer(&buffer_info, nullptr, &buffer) != vk::Result::eSuccess) {
+		std::fprintf(stderr, "HostImportProbe: createBuffer failed\n");
+		return;
+	}
+	const auto requirements = device.getBufferMemoryRequirements(buffer);
+	const auto bits         = properties.memoryTypeBits & requirements.memoryTypeBits;
+	uint32_t   type_index   = UINT32_MAX;
+	const auto& memory      = m_graphics.physical_device_memory_properties;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+		const auto flags = memory.memoryTypes[i].propertyFlags;
+		if ((bits & (1u << i)) != 0 && (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+			type_index = i;
+			if (flags & vk::MemoryPropertyFlagBits::eHostCoherent) { break; }
+		}
+	}
+	std::fprintf(stderr, "HostImportProbe: buffer requirements size=0x%llx align=0x%llx bits=0x%x -> type %d\n",
+	             static_cast<unsigned long long>(requirements.size), static_cast<unsigned long long>(requirements.alignment),
+	             bits, static_cast<int>(type_index));
+	if (type_index != UINT32_MAX && requirements.size <= size) {
+		vk::ImportMemoryHostPointerInfoEXT import_info {};
+		import_info.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		import_info.pHostPointer = host;
+		vk::MemoryAllocateFlagsInfo allocate_flags {};
+		allocate_flags.pNext = &import_info;
+		allocate_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+		vk::MemoryAllocateInfo allocate {};
+		allocate.pNext           = &allocate_flags;
+		allocate.allocationSize  = size;
+		allocate.memoryTypeIndex = type_index;
+		vk::DeviceMemory imported = nullptr;
+		const auto       allocated = device.allocateMemory(&allocate, nullptr, &imported);
+		std::fprintf(stderr, "HostImportProbe: allocateMemory=%s\n", vk::to_string(allocated).c_str());
+		if (allocated == vk::Result::eSuccess) {
+			const auto bound = device.bindBufferMemory(buffer, imported, 0);
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = buffer;
+			const auto address  = device.getBufferAddress(&address_info);
+			std::fprintf(stderr, "HostImportProbe: bind=%s deviceAddress=0x%llx\n", vk::to_string(bound).c_str(),
+			             static_cast<unsigned long long>(address));
+			device.freeMemory(imported, nullptr);
+		}
+	}
+	device.destroyBuffer(buffer, nullptr);
+}
 // KYTY_READBACK_QUEUE=1: a guest readback whose GPU writes are all finished copies on the second queue
 // and publishes before returning, instead of recording the copy behind the main queue's pending work.
 static bool InlineReadbackEnabled() {
@@ -517,6 +635,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (sampled) { record.window_address = window_begin; record.window_size = window_end - window_begin; }
 
 		const auto deferred_before = m_deferred_downloads;
+		m_import_wait_tick = 0;
 		const bool downloaded = DownloadBufferMemory(buffer, window_begin, window_end - window_begin);
 		const bool completed_inline = downloaded && m_deferred_downloads == deferred_before;
 		prepared();
@@ -526,6 +645,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			const auto current = m_scheduler.CurrentTick();
 			Add(m_scheduler.IsFree(writer) ? Metric::ReadFreshDone : Metric::ReadFreshPending);
 			Add(Metric::ReadTailTicks, current > writer ? current - writer : 0);
+		}
+		if (downloaded && completed_inline && m_import_wait_tick != 0) {
+			Scope wait(Metric::ReadGpuWaitNs);
+			m_scheduler.Wait(m_import_wait_tick);
+			Add(Metric::ImportDownloadSkipped);
 		}
 		// UNSAFE measurement only: KYTY_READBACK_UPPER_BOUND=1 skips the waits so the guest may read stale data.
 		static const bool upper_bound = std::getenv("KYTY_READBACK_UPPER_BOUND") != nullptr;
@@ -634,8 +758,11 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferJoin);
 	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferJoinBytes, overlap.Size());
-	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	// Both views are the same guest bytes; copying would only race with newer guest writes.
+	if (!(new_buffer.IsImported() && overlap.IsImported())) {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	}
 	DeleteBuffer(overlap_id);
 }
 
@@ -657,9 +784,30 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	// A buffer may import the guest range's backing bytes only when everything it replaces is imported too, so a
+	// join never has to copy device-local contents over newer guest data.
+	uint8_t*   import_host = nullptr;
+	uint32_t   import_type = UINT32_MAX;
+	const auto buffer_flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	if (ShouldImport(overlap.begin, overlap.end)) {
+		bool all_imported = true;
+		for (auto it = overlap.first; it != overlap.last; ++it) {
+			all_imported = all_imported && m_slot_buffers[it->second].IsImported();
+		}
+		if (all_imported) {
+			import_host = Libs::LibKernel::Memory::FindBackingForImport(overlap.begin, overlap.end - overlap.begin);
+			import_type = Buffer::ImportMemoryType(m_graphics, import_host, overlap.end - overlap.begin, buffer_flags);
+		}
+	}
+	const auto id = import_type != UINT32_MAX
+	    ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, buffer_flags, overlap.end - overlap.begin,
+	                            import_host, import_type)
+	    : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin, buffer_flags,
+	                            overlap.end - overlap.begin);
+	if (import_type != UINT32_MAX) {
+		PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ImportedBuffers);
+		PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ImportedBufferBytes, overlap.end - overlap.begin);
+	}
 	m_slot_buffers[id].created_tick = m_scheduler.CurrentTick();
 	const auto& buffer = m_slot_buffers[id];
 	PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::BufferCreate);
@@ -672,6 +820,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
+	static const bool probe_import = std::getenv("KYTY_HOST_IMPORT_PROBE") != nullptr;
+	if (probe_import && overlap.end - overlap.begin >= (1ull << 20)) {
+		ProbeHostPointerImport(overlap.begin, overlap.end - overlap.begin);
+	}
 	return id;
 }
 
@@ -686,7 +838,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    if (buffer.IsImported()) {
+			    PerformanceDiagnostics::Add(PerformanceDiagnostics::Metric::ImportUploadSkippedBytes, total_size);
+			    return;
+		    }
+		    source = UploadCopies(buffer, copies, total_size);
+	    });
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -797,6 +955,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		MarkGpuWritten(vaddr, size);
+		if (buffer.IsImported()) { m_scheduler.NoteHostVisibleWrite(); }
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -819,6 +978,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	if (written_size != 0) {
 		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
 		MarkGpuWritten(written_vaddr, written_size);
+		if (buffer.IsImported()) { m_scheduler.NoteHostVisibleWrite(); }
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

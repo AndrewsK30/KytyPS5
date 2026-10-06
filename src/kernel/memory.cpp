@@ -892,6 +892,11 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+uint8_t* FindBackingForImport(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space == nullptr ? nullptr
+	                                      : const_cast<uint8_t*>(g_guest_address_space->FindBacking(vaddr, size));
+}
+
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_guest_address_space == nullptr) {
 		return nullptr;

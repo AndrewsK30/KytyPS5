@@ -114,6 +114,9 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The writable alias bytes of [vaddr, vaddr + size) when one mapping holds all of them, else nullptr. It is the
+// memory a GPU can import as host memory: page protections apply to the guest view, never to the alias.
+[[nodiscard]] uint8_t* FindBackingForImport(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to

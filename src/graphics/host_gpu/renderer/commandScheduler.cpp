@@ -375,6 +375,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_host_visible_writes) {
+		m_host_visible_writes = false;
+		m_command.EndRendering();
+		vk::MemoryBarrier host_barrier {};
+		host_barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		host_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost, {}, 1, &host_barrier, 0, nullptr, 0, nullptr);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

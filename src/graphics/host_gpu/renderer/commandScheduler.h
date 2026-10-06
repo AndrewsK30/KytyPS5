@@ -48,6 +48,9 @@ public:
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// A shader wrote memory the guest reads through the host (an imported buffer): the command buffer ends with a
+	// memory dependency to the host so the writes are visible once its tick completes.
+	void NoteHostVisibleWrite() noexcept { m_host_visible_writes = true; }
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
@@ -115,6 +118,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_host_visible_writes = false;
 	std::mutex                   m_submit_mutex;
 	std::condition_variable      m_submit_available;
 	std::condition_variable      m_submit_idle;

@@ -39,6 +39,13 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A buffer whose memory IS the guest range's backing bytes (VK_EXT_external_memory_host). `host` must be
+	// aligned to GraphicContext::host_pointer_alignment, and `memory_type` come from ImportMemoryType().
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
+	       uint64_t size, uint8_t* host, uint32_t memory_type);
+	// The memory type that can hold `host` for a buffer of `flags`, or UINT32_MAX if the driver refuses it.
+	[[nodiscard]] static uint32_t ImportMemoryType(GraphicContext& graphics, const uint8_t* host, uint64_t size,
+	                                              vk::BufferUsageFlags flags);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -46,6 +53,7 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool IsImported() const noexcept { return m_imported_memory != nullptr; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -93,6 +101,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory               m_imported_memory = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;

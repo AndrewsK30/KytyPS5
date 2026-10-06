@@ -75,6 +75,9 @@ struct GraphicContext {
 	// so they need not wait behind the main queue's pending work. Null if the family has one queue.
 	vk::Queue                          readback_queue = nullptr;
 	uint32_t                           queue_count    = 1;
+	// VK_EXT_external_memory_host: enabled flag and minImportedHostPointerAlignment (0 when unavailable).
+	bool                               external_memory_host         = false;
+	uint64_t                           host_pointer_alignment       = 0;
 	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {

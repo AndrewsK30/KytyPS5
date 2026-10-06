@@ -157,6 +157,14 @@ private:
 	                                        uint64_t total_size, bool inline_ok);
 	// Copies GPU-written bytes the GPU has already finished on the readback queue and publishes them
 	// to guest memory before returning, without waiting for the main queue's pending work.
+	// KYTY_HOST_IMPORT_PROBE=1: for the first large buffers, try importing the guest range's backing memory as Vulkan
+	// host memory (VK_EXT_external_memory_host) and log whether the driver accepts it. Measurement only.
+	void ProbeHostPointerImport(uint64_t vaddr, uint64_t size);
+	// KYTY_HOST_IMPORT=1 (needs KYTY_LABELS_AFTER_GPU): buffers inside KYTY_HOST_IMPORT_RANGES=<hex>+<hex size>,...
+	// use the guest range's backing bytes as their memory, so CPU writes need no upload and GPU writes need no
+	// copy back, only a wait for the writer's tick. Page tracking is unchanged.
+	[[nodiscard]] bool ShouldImport(uint64_t begin, uint64_t end) const;
+	uint64_t m_import_wait_tick = 0;
 	[[nodiscard]] bool TryDownloadInline(Buffer& buffer, std::span<const vk::BufferCopy> copies,
 	                                      Buffer& download, const uint8_t* mapped, uint64_t offset,
 	                                      uint64_t total_size);

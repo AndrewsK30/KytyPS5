@@ -30,6 +30,7 @@ enum class Metric : unsigned {
 	CatPm4Ns, CatDrawNs, CatDispatchNs, CatBindingsNs, CatBufferCacheNs, CatImageCacheNs, CatTilerNs, CatPipelineNs, CatWaitNs, CatSubmitNs, CatGcNs, CatCommandNs, CatMaterializeNs,
 	CatPm4Calls, CatDrawCalls, CatDispatchCalls, CatBindingsCalls, CatBufferCacheCalls, CatImageCacheCalls, CatTilerCalls, CatPipelineCalls, CatWaitCalls, CatSubmitCalls, CatGcCalls, CatCommandCalls, CatMaterializeCalls,
 	ProtectCalls, GuestFaultRead, GuestFaultWrite,
+	ImportedBuffers, ImportedBufferBytes, ImportUploadSkippedBytes, ImportDownloadSkipped,
 	Count
 };
 
